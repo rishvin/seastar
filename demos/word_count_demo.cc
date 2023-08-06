@@ -43,15 +43,12 @@ public:
       : _fileDesc{std::move(fileDesc)}, _fileOffset{startOffset},
         _estimatedBytesToRead{estimatedBytesToRead} {}
 
-  seastar::future<std::pair<WordCountMapPtr, std::string>> process() {
+  seastar::future<WordCountMapPtr> process() {
     return seastar::repeat([this] {
              return seastar::do_with(
                  seastar::allocate_aligned_buffer<char>(kBufferSize,
                                                         kBufferSize),
                  [this](auto &buffer) {
-                   // logger.info("Reading {} bytes from offset {}",
-                   // kBufferSize,
-                   //             _fileOffset);
                    return _fileDesc
                        .dma_read(_fileOffset, buffer.get(), kBufferSize)
                        .then([this, &buffer](size_t bytesRead) {
@@ -59,21 +56,8 @@ public:
                            return seastar::stop_iteration::yes;
                          }
 
-                         // Can I directly go to _populateRemaining for the
-                         // first time?
-
-                         // logger.info("Before Starting in buffer, "
-                         //             "_totalBytesRead: {}, "
-                         //             "_estimatedBytesToRead: {}, bytesRead:
-                         //             {}", _totalBytesRead,
-                         //             _estimatedBytesToRead, bytesRead);
                          auto bufferOffset =
                              _getBufferStartOffset(buffer.get(), bytesRead);
-                         // logger.info("Starting from offset {} in buffer, "
-                         //             "_totalBytesRead: {}, "
-                         //             "_estimatedBytesToRead: {}, bytesRead:
-                         //             {}", bufferOffset, _totalBytesRead,
-                         //             _estimatedBytesToRead, bytesRead);
 
                          if (_totalBytesRead < _estimatedBytesToRead) {
                            std::tie(_isComplete, bufferOffset) =
@@ -83,21 +67,9 @@ public:
 
                          if (!_isComplete &&
                              _totalBytesRead >= _estimatedBytesToRead) {
-                           //  logger.info(
-                           //      "Populating remaining with _totalBytesRead:
-                           //      {}, "
-                           //      "_estimatedBytesToRead: {}, bytesRead: {}",
-                           //      _totalBytesRead, _estimatedBytesToRead,
-                           //      bytesRead);
                            std::tie(_isComplete, bufferOffset) =
                                _populateRemaining(buffer.get(), bytesRead,
                                                   bufferOffset);
-                           // logger.info(
-                           //     "After Populating remaining with "
-                           //     "_totalBytesRead: {}, "
-                           //     "_estimatedBytesToRead: {}, bytesRead: {}",
-                           //     _totalBytesRead, _estimatedBytesToRead,
-                           //     bytesRead);
                          }
 
                          _fileOffset += kBufferSize;
@@ -108,9 +80,8 @@ public:
                  });
            })
         .then([this] {
-          return seastar::make_ready_future<
-              std::pair<WordCountMapPtr, std::string>>(
-              std::make_pair(std::move(_wordCountMap), std::move(_temp)));
+          return seastar::make_ready_future<WordCountMapPtr>(
+              std::move(_wordCountMap));
         });
   }
 
@@ -167,9 +138,7 @@ private:
     }
 
     if (!word.empty()) {
-      _temp += word + " ";
       (*_wordCountMap)[word]++;
-      // logger.info("Inserted word {} into map", word);
       word.clear();
     }
   }
@@ -183,8 +152,6 @@ public:
   bool _isComplete = false;
 
   std::string _word;
-
-  std::string _temp;
 
   WordCountMapPtr _wordCountMap = std::make_unique<WordCountMap>();
 };
@@ -215,8 +182,6 @@ private:
     size_t chunkSize = fileSize / seastar::smp::count;
     chunkSize = chunkSize / kBufferSize * kBufferSize;
     chunkSize = chunkSize > kBufferSize ? chunkSize : kBufferSize;
-    logger.info("File size: {}, chunk size: {}, cores: {}", fileSize, chunkSize,
-                seastar::smp::count);
     return seastar::do_with(
         filePath, fileSize, chunkSize,
         [this](auto &filePath, auto &fileSize, auto &chunkSize) {
@@ -242,17 +207,8 @@ private:
           return seastar::do_with(
               WordCount(std::move(fileDesc), offset, bytesToRead),
               [](WordCount &wordCount) {
-                // logger.info(
-                //     "The address of wordcount:{}, fileDesc:{}",
-                //     static_cast<void *>(std::addressof(wordCount)),
-                //     static_cast<void
-                //     *>(std::addressof(wordCount._fileDesc)));
-                return wordCount.process().then([](auto map) {
-                  logger.info("The size of map:{}", map.first->size());
-                  // logger.info("{}", map.second);
-                  //  for (const auto &pair : *map) {
-                  //    logger.info("{}:{}", pair.first, pair.second);
-                  //  }
+                return wordCount.process().then([](auto &&wordCountMap) {
+                  logger.info("{}", wordCountMap->size());
                 });
               });
         });
@@ -268,26 +224,4 @@ int main(int argc, char **argv) {
   seastar::app_template app;
   ParallelFileProcessor processor;
   return processor.run(argc, argv);
-  // app.add_options()("file_path",
-  //                   boost::program_options::value<std::string>()->required(),
-  //                   "Path to file to count words in");
-
-  // return app.run(argc, argv, [&app] {
-  //   auto &&config = app.configuration();
-  //   auto filePath = config["file_path"].as<std::string>();
-  //   return seastar::open_file_dma(filePath, seastar::open_flags::ro)
-  //       .then([](seastar::file fileDesc) {
-  //         const auto fileSize = fileDesc.size().get0();
-  //         return seastar::do_with(
-  //             WordCount(std::move(fileDesc), 0, fileSize),
-  //             [](WordCount &wordCount) {
-  //               return wordCount.process().then([](WordCountMapPtr map) {
-  //                 for (const auto &pair : *map) {
-  //                   std::cout << pair.first << " " << pair.second <<
-  //                   std::endl;
-  //                 }
-  //               });
-  //             });
-  //       });
-  // });
 }
