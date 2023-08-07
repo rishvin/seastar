@@ -36,18 +36,18 @@ using WordCountMap = std::unordered_map<std::string, size_t>;
 using WordCountMapPtr = std::unique_ptr<WordCountMap>;
 using ShouldReadBufferFunc = std::function<bool(const char *, size_t)>;
 
-class FileMapReduceTask {
+class DistributedFileProcessorTask {
 public:
-  virtual ~FileMapReduceTask() = default;
+  virtual ~DistributedFileProcessorTask() = default;
   virtual void map(const char &ch) = 0;
   virtual void onMapComplete() = 0;
-  virtual void reduce(const FileMapReduceTask &other) = 0;
+  virtual void reduce(const DistributedFileProcessorTask &other) = 0;
 };
 
-using FileMapReduceTaskPtr = std::unique_ptr<FileMapReduceTask>;
+using FileMapReduceTaskPtr = std::unique_ptr<DistributedFileProcessorTask>;
 using FileMapReduceTaskFactoryFunc = std::function<FileMapReduceTaskPtr()>;
 
-class WordCountTask : public FileMapReduceTask {
+class WordCountTask : public DistributedFileProcessorTask {
 public:
   void map(const char &ch) final {
     static constexpr const char *kDelimiters = " \n.,:;";
@@ -66,7 +66,8 @@ public:
     logger.info("Total words: {}", _wordCountMap->size());
   }
 
-  void reduce(const FileMapReduceTask &otherFileMapReduceTask) final {
+  void
+  reduce(const DistributedFileProcessorTask &otherFileMapReduceTask) final {
     const auto &otherWordCountMap =
         static_cast<const WordCountTask &>(otherFileMapReduceTask)
             ._wordCountMap;
@@ -85,14 +86,14 @@ private:
   WordCountMapPtr _wordCountMap = std::make_unique<WordCountMap>();
 };
 
-class FileMapReduceProcessor {
+class FileChunkProcessor {
 public:
-  FileMapReduceProcessor(seastar::file &&fileDesc, size_t startOffset,
-                         size_t estimatedBytesToRead,
-                         FileMapReduceTaskPtr &&mapReduceTask)
+  FileChunkProcessor(seastar::file &&fileDesc, size_t startOffset,
+                     size_t estimatedBytesToRead,
+                     FileMapReduceTaskPtr &&fileProcessorTask)
       : _fileDesc{std::move(fileDesc)}, _fileOffset{startOffset},
         _estimatedBytesToRead{estimatedBytesToRead}, _mapReduceTask{std::move(
-                                                         mapReduceTask)} {}
+                                                         fileProcessorTask)} {}
 
   seastar::future<FileMapReduceTaskPtr> process() {
     return seastar::repeat([this] {
@@ -195,9 +196,10 @@ public:
   FileMapReduceTaskPtr _mapReduceTask;
 };
 
-class FileMapReduce {
+class DistributedFileProcessor {
 public:
-  FileMapReduce(FileMapReduceTaskFactoryFunc &&mapReduceTaskFactoryFunc)
+  DistributedFileProcessor(
+      FileMapReduceTaskFactoryFunc &&mapReduceTaskFactoryFunc)
       : _mapReduceTaskFactoryFunc{std::move(mapReduceTaskFactoryFunc)} {
     _app.add_options()("file_path",
                        boost::program_options::value<std::string>()->required(),
@@ -206,57 +208,62 @@ public:
 
   int run(int argc, char **argv) {
     return _app.run(argc, argv, [this] {
+      static constexpr const char *kFilePathKey = "file_path";
+
       auto &&config = _app.configuration();
       const auto filePath = config[kFilePathKey].as<std::string>();
 
       return seastar::file_stat(filePath).then(
           [this, filePath](seastar::stat_data &&stat) -> seastar::future<> {
-            return _mapFileRegionToCores(filePath, stat.size);
+            return _startDistributedProcessing(filePath, stat.size);
           });
     });
   }
 
 private:
-  seastar::future<> _mapFileRegionToCores(const std::string &filePath,
-                                          const size_t &fileSize) {
-    size_t chunkSize = fileSize / seastar::smp::count;
-    chunkSize = chunkSize / kBufferSize * kBufferSize;
-    chunkSize = chunkSize > kBufferSize ? chunkSize : kBufferSize;
+  seastar::future<> _startDistributedProcessing(const std::string &filePath,
+                                                const size_t &fileSize) {
+    size_t estimatedChunkSize = fileSize / seastar::smp::count;
+    estimatedChunkSize = estimatedChunkSize / kBufferSize * kBufferSize;
+    estimatedChunkSize =
+        estimatedChunkSize > kBufferSize ? estimatedChunkSize : kBufferSize;
+
     return seastar::do_with(
-        filePath, fileSize, chunkSize,
-        [this](auto &filePath, auto &fileSize, auto &chunkSize) {
-          return seastar::smp::invoke_on_all(
-              [this, &filePath, &fileSize, &chunkSize] {
-                const auto coreId = seastar::this_shard_id();
-                const size_t offset = coreId * chunkSize;
-                const size_t bytesToRead =
-                    coreId != seastar::smp::count - 1
-                        ? chunkSize
-                        : fileSize - (seastar::smp::count - 2) * chunkSize;
-                return _openFileRegionInCore(filePath, fileSize, offset,
-                                             bytesToRead);
-              });
+        filePath, fileSize, estimatedChunkSize,
+        [this](auto &filePath, auto &fileSize, auto &estimatedChunkSize) {
+          return seastar::smp::invoke_on_all([this, &filePath, &fileSize,
+                                              &estimatedChunkSize] {
+            return _processFileChunk(filePath, fileSize, estimatedChunkSize);
+          });
         });
   }
 
-  seastar::future<> _openFileRegionInCore(const std::string &filePath,
-                                          const size_t &fileSize, size_t offset,
-                                          size_t bytesToRead) {
+  seastar::future<> _processFileChunk(const std::string &filePath,
+                                      const size_t &fileSize,
+                                      const size_t &estimatedChunkSize) {
+    const auto coreId = seastar::this_shard_id();
+    const size_t offset = coreId * estimatedChunkSize;
+    const size_t estimatedBytesToRead =
+        coreId != seastar::smp::count - 1
+            ? estimatedChunkSize
+            : fileSize - (seastar::smp::count - 2) * estimatedChunkSize;
+
     return seastar::open_file_dma(filePath, seastar::open_flags::ro)
-        .then([this, fileSize, offset, bytesToRead](seastar::file fileDesc) {
-          auto fileProcessor =
-              FileMapReduceProcessor(std::move(fileDesc), offset, bytesToRead,
-                                     _mapReduceTaskFactoryFunc());
-          return seastar::do_with(
-              std::move(fileProcessor), [](auto &fileProcessor) {
-                return fileProcessor.process().then([](auto &&mapReduceTask) {
-                  mapReduceTask->onMapComplete();
-                });
-              });
+        .then([this, fileSize, offset,
+               estimatedBytesToRead](seastar::file fileDesc) {
+          auto fileChunkProcessor = FileChunkProcessor(
+              std::move(fileDesc), offset, estimatedBytesToRead,
+              _mapReduceTaskFactoryFunc());
+          return seastar::do_with(std::move(fileChunkProcessor),
+                                  [](auto &fileChunkProcessor) {
+                                    return fileChunkProcessor.process().then(
+                                        [](auto &&fileProcessorTask) {
+                                          fileProcessorTask->onMapComplete();
+                                        });
+                                  });
         });
   }
 
-  static constexpr const char *kFilePathKey = "file_path";
   seastar::app_template _app;
 
   FileMapReduceTaskFactoryFunc _mapReduceTaskFactoryFunc;
@@ -266,19 +273,6 @@ private:
 
 int main(int argc, char **argv) {
   seastar::app_template app;
-  FileMapReduce processor(WordCountTask::create);
-
-  // return app.run(argc, argv, [] {
-  //   std::vector<int> chunks = {1, 2, 3, 4};
-  //   auto mapper = [](auto &c) { return seastar::make_ready_future<int>(c); };
-  //   return seastar::map_reduce(
-  //              chunks.begin(), chunks.end(), mapper, 0,
-  //              [](const int &c1, const int &c2) { return c1 + c2; })
-  //       .then([](auto result) {
-  //         std::cout << result << std::endl;
-  //         return seastar::make_ready_future<>();
-  //       });
-  // });
-
+  DistributedFileProcessor processor(WordCountTask::create);
   return processor.run(argc, argv);
 }
