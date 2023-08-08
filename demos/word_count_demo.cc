@@ -31,58 +31,29 @@
 namespace {
 seastar::logger logger("word_count");
 
-static constexpr size_t kBufferSize = 4096;
+// The page size for doing I/O operations.
+static constexpr size_t kPageSize = 4096;
 
+/**
+ * An abstract class that represent the task to be performed on the file. Each
+ * task is associated with the FilePrcessor.
+ */
 class FileProcessorTask {
 public:
   virtual ~FileProcessorTask() = default;
+
+  // Called when each character of the file is processed.
   virtual void process(const char &ch) = 0;
 };
 
 using FileProcessorTaskPtr = std::unique_ptr<FileProcessorTask>;
 
-class WordCountTask : public FileProcessorTask {
-public:
-  void process(const char &ch) final {
-    static constexpr const char *kDelimiters = " \n.,:;";
-    if (std::strchr(kDelimiters, ch) == nullptr) {
-      _word += ch;
-      return;
-    }
-
-    if (!_word.empty()) {
-      (*_wordCountMap)[_word]++;
-      _word.clear();
-    }
-  }
-
-  static void onComplete(std::vector<FileProcessorTaskPtr> &&tasks) {
-    std::unordered_map<std::string, size_t> aggWordCountMap;
-    size_t total_words = 0;
-    for (auto &&task : tasks) {
-      auto &wordCountTask = dynamic_cast<WordCountTask &>(*task);
-      for (auto &&[word, count] : *wordCountTask._wordCountMap) {
-        aggWordCountMap[word] += count;
-        total_words += count;
-      }
-    }
-
-    logger.info("--Word count report: Total: {}", total_words);
-    for (auto &&[word, count] : aggWordCountMap) {
-      logger.info(" {}: {}", word, count);
-    }
-  }
-
-  static FileProcessorTaskPtr create() {
-    return std::make_unique<WordCountTask>();
-  }
-
-private:
-  std::string _word;
-  std::unique_ptr<std::unordered_map<std::string, size_t>> _wordCountMap =
-      std::make_unique<std::unordered_map<std::string, size_t>>();
-};
-
+/**
+ * A class the processes a chunk of the provided file 'filePath'. A chunk is a
+ * part of the file and its starting offset is determined by the 'startOffset'.
+ * The parameter 'estimatedBytesToRead' is used to determine the estimated size
+ * of bytes to read, the processor can read more than the provided chunk size.
+ */
 class FileProcessor {
 public:
   FileProcessor(const std::string &filePath, const size_t &startOffset,
@@ -96,11 +67,12 @@ public:
           _fileDesc = std::move(fileDesc);
           return seastar::repeat([this] {
                    return seastar::do_with(
-                       seastar::allocate_aligned_buffer<char>(kBufferSize,
-                                                              kBufferSize),
+                       // Allocate a buffer aligned to the page size.
+                       seastar::allocate_aligned_buffer<char>(kPageSize,
+                                                              kPageSize),
                        [this](auto &buffer) {
                          return _fileDesc
-                             .dma_read(_fileOffset, buffer.get(), kBufferSize)
+                             .dma_read(_fileOffset, buffer.get(), kPageSize)
                              .then([this, &buffer](size_t bytesRead) {
                                return _processBuffer(buffer.get(), bytesRead)
                                           ? seastar::stop_iteration::yes
@@ -121,20 +93,28 @@ private:
       return true;
     }
 
+    // Determines if the file processing is complete or not.
     auto isComplete = false;
+
+    // The offset of the buffer where the processing should start.
     auto bufferOffset = _getBufferStartOffset(buffer, bufferSize);
 
+    // If the total bytes read is less than the estimated bytes to read, then
+    // continue processing.
     if (_totalBytesRead < _estimatedBytesToRead) {
       std::tie(isComplete, bufferOffset) =
-          _populateWordCount(buffer, bufferSize, bufferOffset);
+          _processChars(buffer, bufferSize, bufferOffset);
     }
 
+    // Even if the total bytes read is greater than the estimated bytes to read
+    // but the chunk is not fully processed because the last character read was
+    // not a new line character, then continue processing.
     if (!isComplete && _totalBytesRead >= _estimatedBytesToRead) {
       std::tie(isComplete, bufferOffset) =
           _populateRemaining(buffer, bufferSize, bufferOffset);
     }
 
-    _fileOffset += kBufferSize;
+    _fileOffset += kPageSize;
     return isComplete;
   }
 
@@ -143,6 +123,8 @@ private:
       return 0;
     }
 
+    // If the chunk start offset lies in the middle of a line, then skip all
+    // characters until a new line character is found.
     const char *notFound = buffer + bufferSize;
     const char *result = std::find(buffer, buffer + bufferSize, '\n');
     auto offset = result == notFound ? bufferSize : result - buffer + 1;
@@ -150,14 +132,13 @@ private:
     return offset;
   }
 
-  std::pair<bool, size_t> _populateWordCount(const char *buffer,
-                                             const size_t &bufferSize,
-                                             size_t offset) {
+  std::pair<bool, size_t>
+  _processChars(const char *buffer, const size_t &bufferSize, size_t offset) {
     char ch = '\0';
     for (; offset < bufferSize && _totalBytesRead < _estimatedBytesToRead;
          offset++) {
       ch = buffer[offset];
-      _executeMap(ch);
+      _invokeTaskProcessor(ch);
     }
 
     return {ch == '\n', offset};
@@ -166,10 +147,11 @@ private:
   std::pair<bool, size_t> _populateRemaining(const char *buffer,
                                              const size_t &bufferSize,
                                              size_t offset) {
+    // Process all characters until a new line character is found.
     bool isComplete = false;
     for (; offset < bufferSize; offset++) {
       const char ch = buffer[offset];
-      _executeMap(ch);
+      _invokeTaskProcessor(ch);
 
       if (ch == '\n') {
         isComplete = true;
@@ -180,7 +162,7 @@ private:
     return {isComplete, offset};
   }
 
-  void _executeMap(const char &ch) {
+  void _invokeTaskProcessor(const char &ch) {
     _totalBytesRead++;
     _task->process(ch);
   }
@@ -194,24 +176,36 @@ private:
   seastar::file _fileDesc;
 
   FileProcessorTaskPtr _task;
-
-  seastar::promise<FileProcessorTaskPtr> _promise;
 };
 
 using FileProcessorPtr = std::unique_ptr<FileProcessor>;
 
+/**
+ * Provides a set of functions that are used by the FileProcessorRunner.
+ */
 struct FileProcessorRunnerFuncs {
+  // Creates a FileProcessorTaskPtr object.
   std::function<FileProcessorTaskPtr()> createTaskFn;
+
+  // Called when all chunks of a file are processed. The parameter contains the
+  // processed tasks.
   std::function<void(std::vector<FileProcessorTaskPtr> &&)> onCompleteFn;
 };
 
+/**
+ * A class that runs file processors. It takes the path to the file to process,
+ * splits the file into chunks and allocate each chunk to a file processor. Each
+ * file processor runs in a separate shard and process the corresponding chunk
+ * of a file. The results of the file processor are collected and passed to the
+ * onCompleteFn function.
+ */
 class FileProcessorRunner {
 public:
   FileProcessorRunner(FileProcessorRunnerFuncs &&funcs)
       : _funcs{std::move(funcs)} {
     _app.add_options()("file_path",
                        boost::program_options::value<std::string>()->required(),
-                       "Path to file to count words in");
+                       "Path to the file to process");
   }
 
   int run(int argc, char **argv) {
@@ -229,6 +223,12 @@ public:
   }
 
 private:
+  /**
+   * Provides a vector of promises and corresponding futures that are used to
+   * collect the 'FileProcessorTask' from the file processors. The 'onComplete'
+   * function calls the 'onResultReadyFn' function when all the results are
+   * ready.
+   */
   class FileProcessorResults {
   public:
     FileProcessorResults(size_t count) : _promises(count) {
@@ -258,12 +258,15 @@ private:
 
   seastar::future<> _startDistributedProcessing(std::string filePath,
                                                 size_t fileSize) {
+    // Calculate the estimated chunk size aligned to the page size.
     const auto estimatedChunkSize = [&]() {
       size_t chunkSize = fileSize / seastar::smp::count;
-      chunkSize = chunkSize / kBufferSize * kBufferSize;
-      return chunkSize > kBufferSize ? chunkSize : kBufferSize;
+      chunkSize = chunkSize / kPageSize * kPageSize;
+      return chunkSize > kPageSize ? chunkSize : kPageSize;
     }();
 
+    // An instance of 'FileProcessorResults' is used to collect the result from
+    // each file processor and then wait for all results to be ready.
     auto taskResults =
         std::make_shared<FileProcessorResults>(seastar::smp::count);
 
@@ -276,12 +279,16 @@ private:
                      std::move(processor), [taskResults](auto &processor) {
                        return processor->process().then(
                            [taskResults](auto &&processorTask) {
+                             // Move the processed task to the 'taskResults' for
+                             // a particular shard.
                              taskResults->setResult(seastar::this_shard_id(),
                                                     std::move(processorTask));
                            });
                      });
                })
         .then([this, taskResults] {
+          // Wait until all results are ready and then call the provided
+          // 'onCompleteFn' function.
           return taskResults->onComplete(_funcs.onCompleteFn);
         });
   }
@@ -308,6 +315,54 @@ private:
   FileProcessorRunnerFuncs _funcs;
 };
 
+/**
+ * A class the computes the count of each word in a file. After the file is
+ * fully processed, the results from each shard are aggregated and the total
+ * count of each word is printed.
+ */
+class WordCountTask : public FileProcessorTask {
+public:
+  void process(const char &ch) final {
+    static constexpr const char *kDelimiters = " \n.,:;";
+    if (std::strchr(kDelimiters, ch) == nullptr) {
+      _word += ch;
+      return;
+    }
+
+    if (!_word.empty()) {
+      (*_wordCountMap)[_word]++;
+      _word.clear();
+    }
+  }
+
+  static void onComplete(std::vector<FileProcessorTaskPtr> &&tasks) {
+    std::unordered_map<std::string, size_t> aggWordCountMap;
+    size_t total_words = 0;
+    for (auto &&task : tasks) {
+      auto &wordCountTask = dynamic_cast<WordCountTask &>(*task);
+      for (auto &&[word, count] : *wordCountTask._wordCountMap) {
+        aggWordCountMap[word] += count;
+        total_words += count;
+      }
+    }
+
+    // NOTE: This code could stall the shard 0 for some time. The future author
+    // could write the result to a file.
+    logger.info("--Word count report: Total: {}", total_words);
+    for (auto &&[word, count] : aggWordCountMap) {
+      logger.info(" {}: {}", word, count);
+    }
+  }
+
+  static FileProcessorTaskPtr create() {
+    return std::make_unique<WordCountTask>();
+  }
+
+private:
+  std::string _word;
+  std::unique_ptr<std::unordered_map<std::string, size_t>> _wordCountMap =
+      std::make_unique<std::unordered_map<std::string, size_t>>();
+};
 } // namespace
 
 int main(int argc, char **argv) {
