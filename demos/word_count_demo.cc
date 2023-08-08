@@ -106,9 +106,9 @@ private:
           _processChars(buffer, bufferSize, bufferOffset);
     }
 
-    // Even if the total bytes read is greater than the estimated bytes to read
-    // but the chunk is not fully processed because the last character read was
-    // not a new line character, then continue processing.
+    // Even if all bytes of the chunk are processed, a chunk is considered not
+    // fully processed if the last character read was not a new line character.
+    // The processing should continue until a new line character is found.
     if (!isComplete && _totalBytesRead >= _estimatedBytesToRead) {
       std::tie(isComplete, bufferOffset) =
           _populateRemaining(buffer, bufferSize, bufferOffset);
@@ -225,9 +225,8 @@ public:
 private:
   /**
    * Provides a vector of promises and corresponding futures that are used to
-   * collect the 'FileProcessorTask' from the file processors. The 'onComplete'
-   * function calls the 'onResultReadyFn' function when all the results are
-   * ready.
+   * collect the FileProcessorTask from the file processors. The onComplete
+   * function calls the onResultReadyFn function when all the results are ready.
    */
   class FileProcessorResults {
   public:
@@ -316,7 +315,7 @@ private:
 };
 
 /**
- * A class the computes the count of each word in a file. After the file is
+ * A class that computes the count of each word in a file. After the file is
  * fully processed, the results from each shard are aggregated and the total
  * count of each word is printed.
  */
