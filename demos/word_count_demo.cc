@@ -58,15 +58,18 @@ public:
 
   static void onComplete(std::vector<FileProcessorTaskPtr> &&tasks) {
     std::unordered_map<std::string, size_t> aggWordCountMap;
+    size_t total_words = 0;
     for (auto &&task : tasks) {
       auto &wordCountTask = dynamic_cast<WordCountTask &>(*task);
-      auto &wordCountMap = *wordCountTask._wordCountMap;
-      aggWordCountMap.insert(wordCountMap.begin(), wordCountMap.end());
+      for (auto &&[word, count] : *wordCountTask._wordCountMap) {
+        aggWordCountMap[word] += count;
+        total_words += count;
+      }
     }
 
-    logger.info("--Word count report--");
+    logger.info("--Word count report: Total: {}", total_words);
     for (auto &&[word, count] : aggWordCountMap) {
-      logger.info("    {}: {}", word, count);
+      logger.info(" {}: {}", word, count);
     }
   }
 
