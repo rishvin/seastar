@@ -34,20 +34,19 @@ static constexpr size_t kBufferSize = 4096;
 
 using WordCountMap = std::unordered_map<std::string, size_t>;
 using WordCountMapPtr = std::unique_ptr<WordCountMap>;
-using ShouldReadBufferFunc = std::function<bool(const char *, size_t)>;
 
-class DistributedFileProcessorTask {
+class FileProcessorTask {
 public:
-  virtual ~DistributedFileProcessorTask() = default;
+  virtual ~FileProcessorTask() = default;
   virtual void map(const char &ch) = 0;
   virtual void onMapComplete() = 0;
-  virtual void reduce(const DistributedFileProcessorTask &other) = 0;
+  virtual void reduce(const FileProcessorTask &other) = 0;
 };
 
-using FileMapReduceTaskPtr = std::unique_ptr<DistributedFileProcessorTask>;
+using FileMapReduceTaskPtr = std::unique_ptr<FileProcessorTask>;
 using FileMapReduceTaskFactoryFunc = std::function<FileMapReduceTaskPtr()>;
 
-class WordCountTask : public DistributedFileProcessorTask {
+class WordCountTask : public FileProcessorTask {
 public:
   void map(const char &ch) final {
     static constexpr const char *kDelimiters = " \n.,:;";
@@ -66,8 +65,7 @@ public:
     logger.info("Total words: {}", _wordCountMap->size());
   }
 
-  void
-  reduce(const DistributedFileProcessorTask &otherFileMapReduceTask) final {
+  void reduce(const FileProcessorTask &otherFileMapReduceTask) final {
     const auto &otherWordCountMap =
         static_cast<const WordCountTask &>(otherFileMapReduceTask)
             ._wordCountMap;
