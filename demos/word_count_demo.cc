@@ -25,6 +25,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/util/log.hh>
 
 namespace {
@@ -43,8 +44,12 @@ public:
   virtual void reduce(const FileProcessorTask &other) = 0;
 };
 
-using FileMapReduceTaskPtr = std::unique_ptr<FileProcessorTask>;
-using FileMapReduceTaskFactoryFunc = std::function<FileMapReduceTaskPtr()>;
+using FileProcessorTaskPtr = std::unique_ptr<FileProcessorTask>;
+using FileProcessorTaskFactoryFunc = std::function<FileProcessorTaskPtr()>;
+using TaskProcessorTaskPtrPromises =
+    std::vector<seastar::promise<FileProcessorTaskPtr>>;
+using TaskProcessorTaskPtrFutures =
+    std::vector<seastar::future<FileProcessorTaskPtr>>;
 
 class WordCountTask : public FileProcessorTask {
 public:
@@ -75,7 +80,7 @@ public:
     }
   }
 
-  static FileMapReduceTaskPtr create() {
+  static FileProcessorTaskPtr create() {
     return std::make_unique<WordCountTask>();
   }
 
@@ -88,12 +93,12 @@ class FileChunkProcessor {
 public:
   FileChunkProcessor(seastar::file &&fileDesc, size_t startOffset,
                      size_t estimatedBytesToRead,
-                     FileMapReduceTaskPtr &&fileProcessorTask)
+                     FileProcessorTaskPtr &&fileProcessorTask)
       : _fileDesc{std::move(fileDesc)}, _fileOffset{startOffset},
         _estimatedBytesToRead{estimatedBytesToRead}, _mapReduceTask{std::move(
                                                          fileProcessorTask)} {}
 
-  seastar::future<FileMapReduceTaskPtr> process() {
+  seastar::future<FileProcessorTaskPtr> process() {
     return seastar::repeat([this] {
              return seastar::do_with(
                  seastar::allocate_aligned_buffer<char>(kBufferSize,
@@ -109,7 +114,7 @@ public:
                  });
            })
         .then([this] {
-          return seastar::make_ready_future<FileMapReduceTaskPtr>(
+          return seastar::make_ready_future<FileProcessorTaskPtr>(
               std::move(_mapReduceTask));
         });
   }
@@ -191,13 +196,13 @@ public:
   const size_t _estimatedBytesToRead;
   size_t _totalBytesRead = 0;
 
-  FileMapReduceTaskPtr _mapReduceTask;
+  FileProcessorTaskPtr _mapReduceTask;
 };
 
 class DistributedFileProcessor {
 public:
   DistributedFileProcessor(
-      FileMapReduceTaskFactoryFunc &&mapReduceTaskFactoryFunc)
+      FileProcessorTaskFactoryFunc &&mapReduceTaskFactoryFunc)
       : _mapReduceTaskFactoryFunc{std::move(mapReduceTaskFactoryFunc)} {
     _app.add_options()("file_path",
                        boost::program_options::value<std::string>()->required(),
@@ -226,19 +231,38 @@ private:
     estimatedChunkSize =
         estimatedChunkSize > kBufferSize ? estimatedChunkSize : kBufferSize;
 
+    auto taskPromises =
+        std::make_shared<TaskProcessorTaskPtrPromises>(seastar::smp::count);
+    auto taskFutures = std::make_shared<TaskProcessorTaskPtrFutures>();
+    for (auto &taskPromise : *taskPromises) {
+      taskFutures->push_back(taskPromise.get_future());
+    }
+
     return seastar::do_with(
         filePath, fileSize, estimatedChunkSize,
-        [this](auto &filePath, auto &fileSize, auto &estimatedChunkSize) {
-          return seastar::smp::invoke_on_all([this, &filePath, &fileSize,
-                                              &estimatedChunkSize] {
-            return _processFileChunk(filePath, fileSize, estimatedChunkSize);
-          });
+        [this, taskPromises, taskFutures](auto &filePath, auto &fileSize,
+                                          auto &estimatedChunkSize) {
+          return seastar::smp::invoke_on_all([this, taskPromises, &filePath,
+                                              &fileSize, &estimatedChunkSize] {
+                   return _processFileChunk(filePath, fileSize,
+                                            estimatedChunkSize, taskPromises);
+                 })
+              .then([this, taskFutures] {
+                (void)seastar::when_all_succeed(taskFutures->begin(),
+                                                taskFutures->end())
+                    .then([](auto results) {
+                      for (auto &result : results) {
+                        result->onMapComplete();
+                      }
+                    });
+              });
         });
   }
 
-  seastar::future<> _processFileChunk(const std::string &filePath,
-                                      const size_t &fileSize,
-                                      const size_t &estimatedChunkSize) {
+  seastar::future<> _processFileChunk(
+      const std::string &filePath, const size_t &fileSize,
+      const size_t &estimatedChunkSize,
+      std::shared_ptr<TaskProcessorTaskPtrPromises> taskPromises) {
     const auto coreId = seastar::this_shard_id();
     const size_t offset = coreId * estimatedChunkSize;
     const size_t estimatedBytesToRead =
@@ -247,24 +271,26 @@ private:
             : fileSize - (seastar::smp::count - 2) * estimatedChunkSize;
 
     return seastar::open_file_dma(filePath, seastar::open_flags::ro)
-        .then([this, fileSize, offset,
+        .then([this, taskPromises, fileSize, offset,
                estimatedBytesToRead](seastar::file fileDesc) {
           auto fileChunkProcessor = FileChunkProcessor(
               std::move(fileDesc), offset, estimatedBytesToRead,
               _mapReduceTaskFactoryFunc());
-          return seastar::do_with(std::move(fileChunkProcessor),
-                                  [](auto &fileChunkProcessor) {
-                                    return fileChunkProcessor.process().then(
-                                        [](auto &&fileProcessorTask) {
-                                          fileProcessorTask->onMapComplete();
-                                        });
-                                  });
+          return seastar::do_with(
+              std::move(fileChunkProcessor),
+              [taskPromises](auto &fileChunkProcessor) {
+                return fileChunkProcessor.process().then(
+                    [taskPromises](auto &&fileProcessorTask) {
+                      (*taskPromises)[seastar::this_shard_id()].set_value(
+                          std::move(fileProcessorTask));
+                    });
+              });
         });
   }
 
   seastar::app_template _app;
 
-  FileMapReduceTaskFactoryFunc _mapReduceTaskFactoryFunc;
+  FileProcessorTaskFactoryFunc _mapReduceTaskFactoryFunc;
 };
 
 } // namespace
