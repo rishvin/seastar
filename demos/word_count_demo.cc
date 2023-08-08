@@ -33,27 +33,17 @@ seastar::logger logger("word_count");
 
 static constexpr size_t kBufferSize = 4096;
 
-using WordCountMap = std::unordered_map<std::string, size_t>;
-using WordCountMapPtr = std::unique_ptr<WordCountMap>;
-
 class FileProcessorTask {
 public:
   virtual ~FileProcessorTask() = default;
-  virtual void map(const char &ch) = 0;
-  virtual void onMapComplete() = 0;
-  virtual void reduce(const FileProcessorTask &other) = 0;
+  virtual void process(const char &ch) = 0;
 };
 
 using FileProcessorTaskPtr = std::unique_ptr<FileProcessorTask>;
-using FileProcessorTaskFactoryFunc = std::function<FileProcessorTaskPtr()>;
-using TaskProcessorTaskPtrPromises =
-    std::vector<seastar::promise<FileProcessorTaskPtr>>;
-using TaskProcessorTaskPtrFutures =
-    std::vector<seastar::future<FileProcessorTaskPtr>>;
 
 class WordCountTask : public FileProcessorTask {
 public:
-  void map(const char &ch) final {
+  void process(const char &ch) final {
     static constexpr const char *kDelimiters = " \n.,:;";
     if (std::strchr(kDelimiters, ch) == nullptr) {
       _word += ch;
@@ -66,17 +56,17 @@ public:
     }
   }
 
-  void onMapComplete() final {
-    logger.info("Total words: {}", _wordCountMap->size());
-  }
+  static void onComplete(std::vector<FileProcessorTaskPtr> &&tasks) {
+    std::unordered_map<std::string, size_t> aggWordCountMap;
+    for (auto &&task : tasks) {
+      auto &wordCountTask = dynamic_cast<WordCountTask &>(*task);
+      auto &wordCountMap = *wordCountTask._wordCountMap;
+      aggWordCountMap.insert(wordCountMap.begin(), wordCountMap.end());
+    }
 
-  void reduce(const FileProcessorTask &otherFileMapReduceTask) final {
-    const auto &otherWordCountMap =
-        static_cast<const WordCountTask &>(otherFileMapReduceTask)
-            ._wordCountMap;
-
-    for (const auto &[word, count] : *otherWordCountMap) {
-      (*_wordCountMap)[word] += count;
+    logger.info("--Word count report--");
+    for (auto &&[word, count] : aggWordCountMap) {
+      logger.info("    {}: {}", word, count);
     }
   }
 
@@ -86,36 +76,39 @@ public:
 
 private:
   std::string _word;
-  WordCountMapPtr _wordCountMap = std::make_unique<WordCountMap>();
+  std::unique_ptr<std::unordered_map<std::string, size_t>> _wordCountMap =
+      std::make_unique<std::unordered_map<std::string, size_t>>();
 };
 
-class FileChunkProcessor {
+class FileProcessor {
 public:
-  FileChunkProcessor(seastar::file &&fileDesc, size_t startOffset,
-                     size_t estimatedBytesToRead,
-                     FileProcessorTaskPtr &&fileProcessorTask)
-      : _fileDesc{std::move(fileDesc)}, _fileOffset{startOffset},
-        _estimatedBytesToRead{estimatedBytesToRead}, _mapReduceTask{std::move(
-                                                         fileProcessorTask)} {}
+  FileProcessor(const std::string &filePath, const size_t &startOffset,
+                const size_t &estimatedBytesToRead, FileProcessorTaskPtr &&task)
+      : _filePath{filePath}, _fileOffset{startOffset},
+        _estimatedBytesToRead{estimatedBytesToRead}, _task{std::move(task)} {}
 
   seastar::future<FileProcessorTaskPtr> process() {
-    return seastar::repeat([this] {
-             return seastar::do_with(
-                 seastar::allocate_aligned_buffer<char>(kBufferSize,
-                                                        kBufferSize),
-                 [this](auto &buffer) {
-                   return _fileDesc
-                       .dma_read(_fileOffset, buffer.get(), kBufferSize)
-                       .then([this, &buffer](size_t bytesRead) {
-                         return _processBuffer(buffer.get(), bytesRead)
-                                    ? seastar::stop_iteration::yes
-                                    : seastar::stop_iteration::no;
+    return seastar::open_file_dma(_filePath, seastar::open_flags::ro)
+        .then([this](auto fileDesc) {
+          _fileDesc = std::move(fileDesc);
+          return seastar::repeat([this] {
+                   return seastar::do_with(
+                       seastar::allocate_aligned_buffer<char>(kBufferSize,
+                                                              kBufferSize),
+                       [this](auto &buffer) {
+                         return _fileDesc
+                             .dma_read(_fileOffset, buffer.get(), kBufferSize)
+                             .then([this, &buffer](size_t bytesRead) {
+                               return _processBuffer(buffer.get(), bytesRead)
+                                          ? seastar::stop_iteration::yes
+                                          : seastar::stop_iteration::no;
+                             });
                        });
-                 });
-           })
-        .then([this] {
-          return seastar::make_ready_future<FileProcessorTaskPtr>(
-              std::move(_mapReduceTask));
+                 })
+              .then([this] {
+                return seastar::make_ready_future<FileProcessorTaskPtr>(
+                    std::move(_task));
+              });
         });
   }
 
@@ -186,24 +179,33 @@ private:
 
   void _executeMap(const char &ch) {
     _totalBytesRead++;
-    _mapReduceTask->map(ch);
+    _task->process(ch);
   }
 
-public:
-  seastar::file _fileDesc;
-
+private:
+  const std::string _filePath;
   size_t _fileOffset;
   const size_t _estimatedBytesToRead;
   size_t _totalBytesRead = 0;
 
-  FileProcessorTaskPtr _mapReduceTask;
+  seastar::file _fileDesc;
+
+  FileProcessorTaskPtr _task;
+
+  seastar::promise<FileProcessorTaskPtr> _promise;
 };
 
-class DistributedFileProcessor {
+using FileProcessorPtr = std::unique_ptr<FileProcessor>;
+
+struct FileProcessorRunnerFuncs {
+  std::function<FileProcessorTaskPtr()> createTaskFn;
+  std::function<void(std::vector<FileProcessorTaskPtr> &&)> onCompleteFn;
+};
+
+class FileProcessorRunner {
 public:
-  DistributedFileProcessor(
-      FileProcessorTaskFactoryFunc &&mapReduceTaskFactoryFunc)
-      : _mapReduceTaskFactoryFunc{std::move(mapReduceTaskFactoryFunc)} {
+  FileProcessorRunner(FileProcessorRunnerFuncs &&funcs)
+      : _funcs{std::move(funcs)} {
     _app.add_options()("file_path",
                        boost::program_options::value<std::string>()->required(),
                        "Path to file to count words in");
@@ -224,79 +226,90 @@ public:
   }
 
 private:
-  seastar::future<> _startDistributedProcessing(const std::string &filePath,
-                                                const size_t &fileSize) {
-    size_t estimatedChunkSize = fileSize / seastar::smp::count;
-    estimatedChunkSize = estimatedChunkSize / kBufferSize * kBufferSize;
-    estimatedChunkSize =
-        estimatedChunkSize > kBufferSize ? estimatedChunkSize : kBufferSize;
-
-    auto taskPromises =
-        std::make_shared<TaskProcessorTaskPtrPromises>(seastar::smp::count);
-    auto taskFutures = std::make_shared<TaskProcessorTaskPtrFutures>();
-    for (auto &taskPromise : *taskPromises) {
-      taskFutures->push_back(taskPromise.get_future());
+  class FileProcessorResults {
+  public:
+    FileProcessorResults(size_t count) : _promises(count) {
+      _futures.reserve(count);
+      for (auto &promise : _promises) {
+        _futures.push_back(promise.get_future());
+      }
     }
 
-    return seastar::do_with(
-        filePath, fileSize, estimatedChunkSize,
-        [this, taskPromises, taskFutures](auto &filePath, auto &fileSize,
-                                          auto &estimatedChunkSize) {
-          return seastar::smp::invoke_on_all([this, taskPromises, &filePath,
-                                              &fileSize, &estimatedChunkSize] {
-                   return _processFileChunk(filePath, fileSize,
-                                            estimatedChunkSize, taskPromises);
-                 })
-              .then([this, taskFutures] {
-                (void)seastar::when_all_succeed(taskFutures->begin(),
-                                                taskFutures->end())
-                    .then([](auto results) {
-                      for (auto &result : results) {
-                        result->onMapComplete();
-                      }
-                    });
-              });
+    seastar::future<>
+    onComplete(std::function<void(std::vector<FileProcessorTaskPtr> &&)>
+                   onResultReadyFn) {
+      return seastar::when_all_succeed(_futures.begin(), _futures.end())
+          .then([onResultReadyFn](auto results) {
+            onResultReadyFn(std::move(results));
+          });
+    }
+
+    void setResult(size_t coreId, FileProcessorTaskPtr &&result) {
+      _promises[coreId].set_value(std::move(result));
+    }
+
+  private:
+    std::vector<seastar::promise<FileProcessorTaskPtr>> _promises;
+    std::vector<seastar::future<FileProcessorTaskPtr>> _futures;
+  };
+
+  seastar::future<> _startDistributedProcessing(std::string filePath,
+                                                size_t fileSize) {
+    const auto estimatedChunkSize = [&]() {
+      size_t chunkSize = fileSize / seastar::smp::count;
+      chunkSize = chunkSize / kBufferSize * kBufferSize;
+      return chunkSize > kBufferSize ? chunkSize : kBufferSize;
+    }();
+
+    auto taskResults =
+        std::make_shared<FileProcessorResults>(seastar::smp::count);
+
+    return seastar::smp::invoke_on_all(
+               [this, filePath, fileSize, estimatedChunkSize, taskResults] {
+                 auto coreId = seastar::this_shard_id();
+                 auto processor = _createProcessors(coreId, filePath, fileSize,
+                                                    estimatedChunkSize);
+                 return seastar::do_with(
+                     std::move(processor), [taskResults](auto &processor) {
+                       return processor->process().then(
+                           [taskResults](auto &&processorTask) {
+                             taskResults->setResult(seastar::this_shard_id(),
+                                                    std::move(processorTask));
+                           });
+                     });
+               })
+        .then([this, taskResults] {
+          return taskResults->onComplete(_funcs.onCompleteFn);
         });
   }
 
-  seastar::future<> _processFileChunk(
-      const std::string &filePath, const size_t &fileSize,
-      const size_t &estimatedChunkSize,
-      std::shared_ptr<TaskProcessorTaskPtrPromises> taskPromises) {
-    const auto coreId = seastar::this_shard_id();
+  FileProcessorPtr _createProcessors(size_t coreId, std::string filePath,
+                                     size_t fileSize,
+                                     size_t estimatedChunkSize) {
     const size_t offset = coreId * estimatedChunkSize;
     const size_t estimatedBytesToRead =
         coreId != seastar::smp::count - 1
             ? estimatedChunkSize
             : fileSize - (seastar::smp::count - 2) * estimatedChunkSize;
 
-    return seastar::open_file_dma(filePath, seastar::open_flags::ro)
-        .then([this, taskPromises, fileSize, offset,
-               estimatedBytesToRead](seastar::file fileDesc) {
-          auto fileChunkProcessor = FileChunkProcessor(
-              std::move(fileDesc), offset, estimatedBytesToRead,
-              _mapReduceTaskFactoryFunc());
-          return seastar::do_with(
-              std::move(fileChunkProcessor),
-              [taskPromises](auto &fileChunkProcessor) {
-                return fileChunkProcessor.process().then(
-                    [taskPromises](auto &&fileProcessorTask) {
-                      (*taskPromises)[seastar::this_shard_id()].set_value(
-                          std::move(fileProcessorTask));
-                    });
-              });
-        });
+    return std::make_unique<FileProcessor>(filePath, offset,
+                                           estimatedBytesToRead,
+                                           std::move(_funcs.createTaskFn()));
   }
 
   seastar::app_template _app;
 
-  FileProcessorTaskFactoryFunc _mapReduceTaskFactoryFunc;
+  std::shared_ptr<std::vector<FileProcessorPtr>> _processors =
+      std::make_shared<std::vector<FileProcessorPtr>>();
+
+  FileProcessorRunnerFuncs _funcs;
 };
 
 } // namespace
 
 int main(int argc, char **argv) {
   seastar::app_template app;
-  DistributedFileProcessor processor(WordCountTask::create);
+  FileProcessorRunner processor(
+      {WordCountTask::create, WordCountTask::onComplete});
   return processor.run(argc, argv);
 }
