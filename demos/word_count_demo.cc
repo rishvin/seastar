@@ -301,9 +301,8 @@ private:
             ? estimatedChunkSize
             : fileSize - (seastar::smp::count - 2) * estimatedChunkSize;
 
-    return std::make_unique<FileProcessor>(filePath, offset,
-                                           estimatedBytesToRead,
-                                           std::move(_funcs.createTaskFn()));
+    return std::make_unique<FileProcessor>(
+        filePath, offset, estimatedBytesToRead, _funcs.createTaskFn());
   }
 
   seastar::app_template _app;
