@@ -31,341 +31,322 @@
 namespace {
 seastar::logger logger("word_count");
 
-// The page size for doing I/O operations.
-static constexpr size_t kPageSize = 4096;
+// The page size for doing i/o operations.
+static constexpr size_t k_page_size = 4096;
 
 /**
- * An abstract class that represent the task to be performed on the file. Each
- * task is associated with the FilePrcessor.
+ * An abstract class that represents the task to be performed on the file. Each
+ * task is associated with the file_processor.
  */
-class FileProcessorTask {
+class file_processor_task {
 public:
-  virtual ~FileProcessorTask() = default;
+    virtual ~file_processor_task() = default;
 
-  // Called when each character of the file is processed.
-  virtual void process(const char &ch) = 0;
+    // Called when each character of the file is processed.
+    virtual void process(const char& ch) = 0;
 };
 
-using FileProcessorTaskPtr = std::unique_ptr<FileProcessorTask>;
+using file_processor_task_ptr = std::unique_ptr<file_processor_task>;
 
 /**
- * A class the processes a chunk of the provided file 'filePath'. A chunk is a
- * part of the file and its starting offset is determined by the 'startOffset'.
- * The parameter 'estimatedBytesToRead' is used to determine the estimated size
- * of bytes to read, the processor can read more than the provided chunk size.
+ * A class that processes a chunk of the provided file file_path. A chunk is a
+ * part of the file and its starting offset is determined by the start_offset.
+ * The parameter estimated_bytes_to_read is used to determine the estimated
+ * size of bytes to read, the processor can read more than the provided chunk
+ * size.
  */
-class FileProcessor {
+class file_processor {
 public:
-  FileProcessor(const std::string &filePath, const size_t &startOffset,
-                const size_t &estimatedBytesToRead, FileProcessorTaskPtr &&task)
-      : _filePath{filePath}, _fileOffset{startOffset},
-        _estimatedBytesToRead{estimatedBytesToRead}, _task{std::move(task)} {}
+    file_processor(const std::string& file_path, const size_t& start_offset,
+                   const size_t& estimated_bytes_to_read, file_processor_task_ptr&& task)
+        : _file_path{ file_path },
+          _file_offset{ start_offset },
+          _estimated_bytes_to_read{ estimated_bytes_to_read },
+          _task{ std::move(task) } {}
 
-  seastar::future<FileProcessorTaskPtr> process() {
-    return seastar::open_file_dma(_filePath, seastar::open_flags::ro)
-        .then([this](auto fileDesc) {
-          _fileDesc = std::move(fileDesc);
-          return seastar::repeat([this] {
-                   return seastar::do_with(
-                       // Allocate a buffer aligned to the page size.
-                       seastar::allocate_aligned_buffer<char>(kPageSize,
-                                                              kPageSize),
-                       [this](auto &buffer) {
-                         return _fileDesc
-                             .dma_read(_fileOffset, buffer.get(), kPageSize)
-                             .then([this, &buffer](size_t bytesRead) {
-                               return _processBuffer(buffer.get(), bytesRead)
-                                          ? seastar::stop_iteration::yes
-                                          : seastar::stop_iteration::no;
-                             });
-                       });
-                 })
-              .then([this] {
-                return seastar::make_ready_future<FileProcessorTaskPtr>(
-                    std::move(_task));
-              });
-        });
-  }
+    seastar::future<file_processor_task_ptr> process() {
+        return seastar::open_file_dma(_file_path, seastar::open_flags::ro)
+            .then([this](auto file_desc) {
+                _file_desc = std::move(file_desc);
+                return seastar::repeat([this] {
+                           return seastar::do_with(
+                               // Allocate a buffer aligned to the page size.
+                               seastar::allocate_aligned_buffer<char>(k_page_size, k_page_size),
+                               [this](auto& buffer) {
+                                   return _file_desc
+                                       .dma_read(_file_offset, buffer.get(), k_page_size)
+                                       .then([this, &buffer](size_t bytes_read) {
+                                           return _process_buffer(buffer.get(), bytes_read) ?
+                                                      seastar::stop_iteration::yes :
+                                                      seastar::stop_iteration::no;
+                                       });
+                               });
+                       })
+                    .then([this] {
+                        return seastar::make_ready_future<file_processor_task_ptr>(
+                            std::move(_task));
+                    });
+            });
+    }
 
 private:
-  bool _processBuffer(const char *buffer, const size_t &bufferSize) {
-    if (bufferSize == 0) {
-      return true;
+    bool _process_buffer(const char* buffer, const size_t& buffer_size) {
+        if (buffer_size == 0) { return true; }
+
+        // Determines if the file processing is complete or not.
+        auto is_complete = false;
+
+        // The offset of the buffer where the processing should start.
+        auto buffer_offset = _get_buffer_start_offset(buffer, buffer_size);
+
+        // If the total bytes read is less than the estimated bytes to read, then
+        // continue processing.
+        if (_total_bytes_read < _estimated_bytes_to_read) {
+            std::tie(is_complete, buffer_offset)
+                = _process_chars(buffer, buffer_size, buffer_offset);
+        }
+
+        // Even if all bytes of the chunk are processed, a chunk is considered not
+        // fully processed if the last character read was not a new line character.
+        // The processing should continue until a new line character is found.
+        if (!is_complete && _total_bytes_read >= _estimated_bytes_to_read) {
+            std::tie(is_complete, buffer_offset)
+                = _populate_remaining(buffer, buffer_size, buffer_offset);
+        }
+
+        _file_offset += k_page_size;
+        return is_complete;
     }
 
-    // Determines if the file processing is complete or not.
-    auto isComplete = false;
+    size_t _get_buffer_start_offset(const char* buffer, const size_t& buffer_size) {
+        if (_file_offset == 0 || _total_bytes_read > 0) { return 0; }
 
-    // The offset of the buffer where the processing should start.
-    auto bufferOffset = _getBufferStartOffset(buffer, bufferSize);
-
-    // If the total bytes read is less than the estimated bytes to read, then
-    // continue processing.
-    if (_totalBytesRead < _estimatedBytesToRead) {
-      std::tie(isComplete, bufferOffset) =
-          _processChars(buffer, bufferSize, bufferOffset);
+        // If the chunk start offset lies in the middle of a line, then skip all
+        // characters until a new line character is found.
+        const char* not_found = buffer + buffer_size;
+        const char* result = std::find(buffer, buffer + buffer_size, '\n');
+        auto offset = result == not_found ? buffer_size : result - buffer + 1;
+        _total_bytes_read += offset;
+        return offset;
     }
 
-    // Even if all bytes of the chunk are processed, a chunk is considered not
-    // fully processed if the last character read was not a new line character.
-    // The processing should continue until a new line character is found.
-    if (!isComplete && _totalBytesRead >= _estimatedBytesToRead) {
-      std::tie(isComplete, bufferOffset) =
-          _populateRemaining(buffer, bufferSize, bufferOffset);
+    std::pair<bool, size_t> _process_chars(const char* buffer, const size_t& buffer_size,
+                                           size_t offset) {
+        char ch = '\0';
+        for (; offset < buffer_size && _total_bytes_read < _estimated_bytes_to_read; offset++) {
+            ch = buffer[offset];
+            _invoke_task_processor(ch);
+        }
+
+        return { ch == '\n', offset };
     }
 
-    _fileOffset += kPageSize;
-    return isComplete;
-  }
+    std::pair<bool, size_t> _populate_remaining(const char* buffer, const size_t& buffer_size,
+                                                size_t offset) {
+        // Process all characters until a new line character is found.
+        bool is_complete = false;
+        for (; offset < buffer_size; offset++) {
+            const char ch = buffer[offset];
+            _invoke_task_processor(ch);
 
-  size_t _getBufferStartOffset(const char *buffer, const size_t &bufferSize) {
-    if (_fileOffset == 0 || _totalBytesRead > 0) {
-      return 0;
+            if (ch == '\n') {
+                is_complete = true;
+                break;
+            }
+        }
+
+        return { is_complete, offset };
     }
 
-    // If the chunk start offset lies in the middle of a line, then skip all
-    // characters until a new line character is found.
-    const char *notFound = buffer + bufferSize;
-    const char *result = std::find(buffer, buffer + bufferSize, '\n');
-    auto offset = result == notFound ? bufferSize : result - buffer + 1;
-    _totalBytesRead += offset;
-    return offset;
-  }
-
-  std::pair<bool, size_t>
-  _processChars(const char *buffer, const size_t &bufferSize, size_t offset) {
-    char ch = '\0';
-    for (; offset < bufferSize && _totalBytesRead < _estimatedBytesToRead;
-         offset++) {
-      ch = buffer[offset];
-      _invokeTaskProcessor(ch);
+    void _invoke_task_processor(const char& ch) {
+        _total_bytes_read++;
+        _task->process(ch);
     }
-
-    return {ch == '\n', offset};
-  }
-
-  std::pair<bool, size_t> _populateRemaining(const char *buffer,
-                                             const size_t &bufferSize,
-                                             size_t offset) {
-    // Process all characters until a new line character is found.
-    bool isComplete = false;
-    for (; offset < bufferSize; offset++) {
-      const char ch = buffer[offset];
-      _invokeTaskProcessor(ch);
-
-      if (ch == '\n') {
-        isComplete = true;
-        break;
-      }
-    }
-
-    return {isComplete, offset};
-  }
-
-  void _invokeTaskProcessor(const char &ch) {
-    _totalBytesRead++;
-    _task->process(ch);
-  }
 
 private:
-  const std::string _filePath;
-  size_t _fileOffset;
-  const size_t _estimatedBytesToRead;
-  size_t _totalBytesRead = 0;
+    const std::string _file_path;
+    size_t _file_offset;
+    const size_t _estimated_bytes_to_read;
+    size_t _total_bytes_read = 0;
 
-  seastar::file _fileDesc;
+    seastar::file _file_desc;
 
-  FileProcessorTaskPtr _task;
+    file_processor_task_ptr _task;
 };
 
-using FileProcessorPtr = std::unique_ptr<FileProcessor>;
+using file_processor_ptr = std::unique_ptr<file_processor>;
 
 /**
- * Provides a set of functions that are used by the FileProcessorRunner.
+ * Provides a set of functions that are used by the file_processor_runner.
  */
-struct FileProcessorRunnerFuncs {
-  // Creates a FileProcessorTaskPtr object.
-  std::function<FileProcessorTaskPtr()> createTaskFn;
+struct file_processor_runner_funcs {
+    // creates a file_processor_task_ptr object.
+    std::function<file_processor_task_ptr()> create_task_fn;
 
-  // Called when all chunks of a file are processed. The parameter contains the
-  // processed tasks.
-  std::function<void(std::vector<FileProcessorTaskPtr> &&)> onCompleteFn;
+    // Called when all chunks of a file are processed. the parameter contains the
+    // processed tasks.
+    std::function<void(std::vector<file_processor_task_ptr>&&)> on_complete_fn;
 };
 
 /**
- * A class that runs file processors. It takes the path to the file to process,
+ * A class that runs file processors. it takes the path to the file to process,
  * splits the file into chunks and allocate each chunk to a file processor. Each
  * file processor runs in a separate shard and process the corresponding chunk
  * of a file. The results of the file processor are collected and passed to the
- * onCompleteFn function.
+ * on_complete_fn function.
  */
-class FileProcessorRunner {
+class file_processor_runner {
 public:
-  FileProcessorRunner(FileProcessorRunnerFuncs &&funcs)
-      : _funcs{std::move(funcs)} {
-    _app.add_options()("file_path",
-                       boost::program_options::value<std::string>()->required(),
-                       "Path to the file to process");
-  }
+    file_processor_runner(file_processor_runner_funcs&& funcs) : _funcs{ std::move(funcs) } {
+        _app.add_options()("file_path", boost::program_options::value<std::string>()->required(),
+                           "path to the file to process");
+    }
 
-  int run(int argc, char **argv) {
-    return _app.run(argc, argv, [this] {
-      static constexpr const char *kFilePathKey = "file_path";
+    int run(int argc, char** argv) {
+        return _app.run(argc, argv, [this] {
+            static constexpr const char* k_file_path_key = "file_path";
 
-      auto &&config = _app.configuration();
-      const auto filePath = config[kFilePathKey].as<std::string>();
+            auto&& config = _app.configuration();
+            const auto file_path = config[k_file_path_key].as<std::string>();
 
-      return seastar::file_stat(filePath).then(
-          [this, filePath](seastar::stat_data &&stat) -> seastar::future<> {
-            return _startDistributedProcessing(filePath, stat.size);
-          });
-    });
-  }
+            return seastar::file_stat(file_path).then(
+                [this, file_path](seastar::stat_data&& stat) -> seastar::future<> {
+                    return _start_distributed_processing(file_path, stat.size);
+                });
+        });
+    }
 
 private:
-  /**
-   * Provides a vector of promises and corresponding futures that are used to
-   * collect the FileProcessorTask from the file processors. The onComplete
-   * function calls the onResultReadyFn function when all the results are ready.
-   */
-  class FileProcessorResults {
-  public:
-    FileProcessorResults(size_t count) : _promises(count) {
-      _futures.reserve(count);
-      for (auto &promise : _promises) {
-        _futures.push_back(promise.get_future());
-      }
-    }
+    /**
+     * Provides a vector of promises and corresponding futures that are used to
+     * collect the file_processor_task from the file processors. The on_complete
+     * function calls the on_result_ready_fn function when all the results are
+     * ready.
+     */
+    class file_processor_results {
+    public:
+        file_processor_results(size_t count) : _promises(count) {
+            _futures.reserve(count);
+            for (auto& promise : _promises) { _futures.push_back(promise.get_future()); }
+        }
 
-    seastar::future<>
-    onComplete(std::function<void(std::vector<FileProcessorTaskPtr> &&)>
-                   onResultReadyFn) {
-      return seastar::when_all_succeed(_futures.begin(), _futures.end())
-          .then([onResultReadyFn](auto results) {
-            onResultReadyFn(std::move(results));
-          });
-    }
+        seastar::future<> on_complete(
+            std::function<void(std::vector<file_processor_task_ptr>&&)> on_result_ready_fn) {
+            return seastar::when_all_succeed(_futures.begin(), _futures.end())
+                .then(
+                    [on_result_ready_fn](auto results) { on_result_ready_fn(std::move(results)); });
+        }
 
-    void setResult(size_t coreId, FileProcessorTaskPtr &&result) {
-      _promises[coreId].set_value(std::move(result));
-    }
+        void set_result(size_t core_id, file_processor_task_ptr&& result) {
+            _promises[core_id].set_value(std::move(result));
+        }
 
-  private:
-    std::vector<seastar::promise<FileProcessorTaskPtr>> _promises;
-    std::vector<seastar::future<FileProcessorTaskPtr>> _futures;
-  };
+    private:
+        std::vector<seastar::promise<file_processor_task_ptr>> _promises;
+        std::vector<seastar::future<file_processor_task_ptr>> _futures;
+    };
 
-  seastar::future<> _startDistributedProcessing(std::string filePath,
-                                                size_t fileSize) {
-    // Calculate the estimated chunk size aligned to the page size.
-    const auto estimatedChunkSize = [&]() {
-      size_t chunkSize = fileSize / seastar::smp::count;
-      chunkSize = chunkSize / kPageSize * kPageSize;
-      return chunkSize > kPageSize ? chunkSize : kPageSize;
-    }();
+    seastar::future<> _start_distributed_processing(std::string file_path, size_t file_size) {
+        // Calculate the estimated chunk size aligned to the page size.
+        const auto estimated_chunk_size = [&]() {
+            size_t chunk_size = file_size / seastar::smp::count;
+            chunk_size = chunk_size / k_page_size * k_page_size;
+            return chunk_size > k_page_size ? chunk_size : k_page_size;
+        }();
 
-    // An instance of 'FileProcessorResults' is used to collect the result from
-    // each file processor and then wait for all results to be ready.
-    auto taskResults =
-        std::make_shared<FileProcessorResults>(seastar::smp::count);
+        // An instance of file_processor_results is used to collect the result
+        // from each file processor and then wait for all results to be ready.
+        auto task_results = std::make_shared<file_processor_results>(seastar::smp::count);
 
-    return seastar::smp::invoke_on_all(
-               [this, filePath, fileSize, estimatedChunkSize, taskResults] {
-                 auto coreId = seastar::this_shard_id();
-                 auto processor = _createProcessors(coreId, filePath, fileSize,
-                                                    estimatedChunkSize);
-                 return seastar::do_with(
-                     std::move(processor), [taskResults](auto &processor) {
-                       return processor->process().then(
-                           [taskResults](auto &&processorTask) {
-                             // Move the processed task to the 'taskResults' for
-                             // a particular shard.
-                             taskResults->setResult(seastar::this_shard_id(),
-                                                    std::move(processorTask));
-                           });
-                     });
+        return seastar::smp::invoke_on_all([this, file_path, file_size, estimated_chunk_size,
+                                            task_results] {
+                   auto core_id = seastar::this_shard_id();
+                   auto processor
+                       = _create_processors(core_id, file_path, file_size, estimated_chunk_size);
+                   return seastar::do_with(std::move(processor), [task_results](auto& processor) {
+                       return processor->process().then([task_results](auto&& processor_task) {
+                           // move the processed task to the 'task_results' for
+                           // a particular shard.
+                           task_results->set_result(seastar::this_shard_id(),
+                                                    std::move(processor_task));
+                       });
+                   });
                })
-        .then([this, taskResults] {
-          // Wait until all results are ready and then call the provided
-          // 'onCompleteFn' function.
-          return taskResults->onComplete(_funcs.onCompleteFn);
-        });
-  }
+            .then([this, task_results] {
+                // Wait until all results are ready and then call the provided
+                // on_complete_fn function.
+                return task_results->on_complete(_funcs.on_complete_fn);
+            });
+    }
 
-  FileProcessorPtr _createProcessors(size_t coreId, std::string filePath,
-                                     size_t fileSize,
-                                     size_t estimatedChunkSize) {
-    const size_t offset = coreId * estimatedChunkSize;
-    const size_t estimatedBytesToRead =
-        coreId != seastar::smp::count - 1
-            ? estimatedChunkSize
-            : fileSize - (seastar::smp::count - 2) * estimatedChunkSize;
+    file_processor_ptr _create_processors(size_t core_id, std::string file_path, size_t file_size,
+                                          size_t estimated_chunk_size) {
+        const size_t offset = core_id * estimated_chunk_size;
+        const size_t estimated_bytes_to_read
+            = core_id != seastar::smp::count - 1 ?
+                  estimated_chunk_size :
+                  file_size - (seastar::smp::count - 2) * estimated_chunk_size;
 
-    return std::make_unique<FileProcessor>(
-        filePath, offset, estimatedBytesToRead, _funcs.createTaskFn());
-  }
+        return std::make_unique<file_processor>(file_path, offset, estimated_bytes_to_read,
+                                                _funcs.create_task_fn());
+    }
 
-  seastar::app_template _app;
+    seastar::app_template _app;
 
-  std::shared_ptr<std::vector<FileProcessorPtr>> _processors =
-      std::make_shared<std::vector<FileProcessorPtr>>();
+    std::shared_ptr<std::vector<file_processor_ptr>> _processors
+        = std::make_shared<std::vector<file_processor_ptr>>();
 
-  FileProcessorRunnerFuncs _funcs;
+    file_processor_runner_funcs _funcs;
 };
 
 /**
- * A class that computes the count of each word in a file. After the file is
+ * A class that computes the count of each word in a file. after the file is
  * fully processed, the results from each shard are aggregated and the total
  * count of each word is printed.
  */
-class WordCountTask : public FileProcessorTask {
+class word_count_task : public file_processor_task {
 public:
-  void process(const char &ch) final {
-    static constexpr const char *kDelimiters = " \n.,:;";
-    if (std::strchr(kDelimiters, ch) == nullptr) {
-      _word += ch;
-      return;
+    void process(const char& ch) final {
+        static constexpr const char* k_delimiters = " \n.,:;";
+        if (std::strchr(k_delimiters, ch) == nullptr) {
+            _word += ch;
+            return;
+        }
+
+        if (!_word.empty()) {
+            (*_word_count_map)[_word]++;
+            _word.clear();
+        }
     }
 
-    if (!_word.empty()) {
-      (*_wordCountMap)[_word]++;
-      _word.clear();
-    }
-  }
+    static void on_complete(std::vector<file_processor_task_ptr>&& tasks) {
+        std::unordered_map<std::string, size_t> agg_word_count_map;
+        size_t total_words = 0;
+        for (auto&& task : tasks) {
+            auto& wc_task = dynamic_cast<word_count_task&>(*task);
+            for (auto&& [word, count] : *wc_task._word_count_map) {
+                agg_word_count_map[word] += count;
+                total_words += count;
+            }
+        }
 
-  static void onComplete(std::vector<FileProcessorTaskPtr> &&tasks) {
-    std::unordered_map<std::string, size_t> aggWordCountMap;
-    size_t total_words = 0;
-    for (auto &&task : tasks) {
-      auto &wordCountTask = dynamic_cast<WordCountTask &>(*task);
-      for (auto &&[word, count] : *wordCountTask._wordCountMap) {
-        aggWordCountMap[word] += count;
-        total_words += count;
-      }
+        // Note: This code could stall the shard 0 for some time. The future author
+        // could write the result to a file.
+        logger.info("--word count report: total: {}", total_words);
+        for (auto&& [word, count] : agg_word_count_map) { logger.info(" {}: {}", word, count); }
     }
 
-    // NOTE: This code could stall the shard 0 for some time. The future author
-    // could write the result to a file.
-    logger.info("--Word count report: Total: {}", total_words);
-    for (auto &&[word, count] : aggWordCountMap) {
-      logger.info(" {}: {}", word, count);
-    }
-  }
-
-  static FileProcessorTaskPtr create() {
-    return std::make_unique<WordCountTask>();
-  }
+    static file_processor_task_ptr create() { return std::make_unique<word_count_task>(); }
 
 private:
-  std::string _word;
-  std::unique_ptr<std::unordered_map<std::string, size_t>> _wordCountMap =
-      std::make_unique<std::unordered_map<std::string, size_t>>();
+    std::string _word;
+    std::unique_ptr<std::unordered_map<std::string, size_t>> _word_count_map
+        = std::make_unique<std::unordered_map<std::string, size_t>>();
 };
 } // namespace
 
-int main(int argc, char **argv) {
-  seastar::app_template app;
-  FileProcessorRunner processor(
-      {WordCountTask::create, WordCountTask::onComplete});
-  return processor.run(argc, argv);
+int main(int argc, char** argv) {
+    seastar::app_template app;
+    file_processor_runner file_processor({ word_count_task::create, word_count_task::on_complete });
+    return file_processor.run(argc, argv);
 }
