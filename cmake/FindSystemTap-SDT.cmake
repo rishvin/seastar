@@ -17,25 +17,23 @@
 #
 
 #
-# Copyright (C) 2018 Scylladb, Ltd.
+# Copyright (C) 2023 Scylladb, Ltd.
 #
 
-file (READ ${Seastar_DPDK_CONFIG_FILE_IN} dpdk_config)
-file (STRINGS ${Seastar_DPDK_CONFIG_FILE_CHANGES} dpdk_config_changes)
-set (word_pattern "[^\n\r \t]+")
+find_path (SystemTap-SDT_INCLUDE_DIR
+  NAMES sys/sdt.h)
 
-foreach (var ${dpdk_config_changes})
-  if (var MATCHES "(${word_pattern})=(${word_pattern})")
-    set (key ${CMAKE_MATCH_1})
-    set (value ${CMAKE_MATCH_2})
+mark_as_advanced (
+  SystemTap-SDT_INCLUDE_DIR)
 
-    string (REGEX REPLACE
-      "${key}=${word_pattern}"
-      "${key}=${value}"
-      dpdk_config
-      ${dpdk_config})
-  endif ()
-endforeach ()
+include (FindPackageHandleStandardArgs)
 
-file (WRITE ${Seastar_DPDK_CONFIG_FILE_OUT} ${dpdk_config})
-file (APPEND ${Seastar_DPDK_CONFIG_FILE_OUT} "CONFIG_RTE_MACHINE=${Seastar_DPDK_MACHINE}")
+find_package_handle_standard_args (SystemTap-SDT
+  REQUIRED_VARS SystemTap-SDT_INCLUDE_DIR)
+
+if (NOT TARGET SystemTap::SDT)
+  add_library (SystemTap::SDT INTERFACE IMPORTED)
+  set_target_properties (SystemTap::SDT
+    PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES ${SystemTap-SDT_INCLUDE_DIR})
+endif ()

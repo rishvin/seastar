@@ -76,6 +76,10 @@ class connection : public enable_shared_from_this<connection> {
     hook_t _hook;
     future<> _closed;
     internal::client_ref _ref;
+    // Client sends HTTP-1.1 version and assumes the server is 1.1-compatible
+    // too and thus the connection will be persistent by default. If the server
+    // responds with older version, this flag will be dropped (see recv_reply())
+    bool _persistent = true;
 
 public:
     /**
@@ -168,13 +172,14 @@ class client {
     std::unique_ptr<connection_factory> _new_connections;
     unsigned _nr_connections = 0;
     unsigned _max_connections;
+    unsigned long _total_new_connections = 0;
     condition_variable _wait_con;
     connections_list_t _pool;
 
     using connection_ptr = seastar::shared_ptr<connection>;
 
     future<connection_ptr> get_connection();
-    future<> put_connection(connection_ptr con, bool can_cache);
+    future<> put_connection(connection_ptr con);
     future<> shrink_connections();
 
     template <typename Fn>
@@ -265,6 +270,17 @@ public:
 
     unsigned idle_connections_nr() const noexcept {
         return _pool.size();
+    }
+
+    /**
+     * \brief Returns the total number of connection factory invocations made so far
+     *
+     * This is the monotonically-increasing counter describing how "frequently" the
+     * client kicks its factory for new connections.
+     */
+
+    unsigned long total_new_connections_nr() const noexcept {
+        return _total_new_connections;
     }
 };
 

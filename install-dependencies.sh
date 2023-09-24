@@ -43,7 +43,9 @@ debian_packages=(
     liburing-dev
     gcc
     make
+    meson
     python3
+    python3-pyelftools
     systemtap-sdt-dev
     libtool
     cmake
@@ -57,6 +59,8 @@ debian_packages=(
     doxygen
     openssl
     pkg-config
+    libprotobuf-dev
+    protobuf-compiler
 )
 
 # seastar doesn't directly depend on these packages. They are
@@ -79,7 +83,9 @@ redhat_packages=(
     liburing-devel
     gcc
     make
+    meson
     python3
+    python3-pyelftools
     systemtap-sdt-devel
     libtool
     cmake
@@ -92,6 +98,8 @@ redhat_packages=(
     fmt-devel
     boost-devel
     valgrind-devel
+    protobuf-devel
+    protobuf-compiler
     "${transitive[@]}"
 )
 
@@ -165,6 +173,8 @@ arch_packages=(
     lksctp-tools
     lz4
     make
+    meson
+    python-pyelftools
     libtool
     cmake
     yaml-cpp
@@ -206,6 +216,7 @@ opensuse_packages=(
     liblz4-devel
     libnuma-devel
     lksctp-tools-devel
+    meson
     ninja
     ragel
     xfsprogs-devel

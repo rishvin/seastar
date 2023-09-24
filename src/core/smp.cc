@@ -59,7 +59,7 @@ struct smp_service_group_impl {
 #endif
 };
 
-static smp_service_group_semaphore smp_service_group_management_sem{1, named_semaphore_exception_factory{"smp_service_group_management_sem"}};
+static thread_local smp_service_group_semaphore smp_service_group_management_sem{1, named_semaphore_exception_factory{"smp_service_group_management_sem"}};
 static thread_local std::vector<smp_service_group_impl> smp_service_groups;
 
 static named_semaphore_exception_factory make_service_group_semaphore_exception_factory(unsigned id, shard_id client_cpu, shard_id this_cpu, std::optional<sstring> smp_group_name) {
@@ -216,7 +216,7 @@ internal::memory_prefaulter::work(std::vector<memory::internal::memory_range>& r
 #else
         // atomic_ref would be better, but alas C++20 only
         auto p1 = reinterpret_cast<volatile std::atomic<char>*>(p);
-        p->fetch_or(0, std::memory_order_relaxed);
+        p1->fetch_or(0, std::memory_order_relaxed);
 #endif
     };
     while (!_stop_request.load(std::memory_order_relaxed) && !ranges.empty()) {

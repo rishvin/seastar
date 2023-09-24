@@ -41,7 +41,7 @@ set (Seastar_DPDK_MACHINE
   "native"
   CACHE
   STRING
-  "Configure DPDK for this processor architecture (if `Seastar_DPDK` is enabled). A DPDK code name abbreviation (e.g., ivb)")
+  "Configure DPDK for this processor architecture (if `Seastar_DPDK` is enabled). It configures -march or -mcpu")
 
 project (Seastar
   VERSION 1.0
@@ -401,9 +401,11 @@ seastar_find_dependencies ()
 
 # Private build dependencies not visible to consumers
 find_package (ragel 6.10 REQUIRED)
+find_package (ucontext REQUIRED)
 find_package (Threads REQUIRED)
 find_package (PthreadSetName REQUIRED)
 find_package (Valgrind REQUIRED)
+find_package (SystemTap-SDT)
 
 #
 # Code generation helpers.
@@ -473,14 +475,9 @@ seastar_generate_ragel (
   IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/http/response_parser.rl
   OUT_FILE ${Seastar_GEN_BINARY_DIR}/include/seastar/http/response_parser.hh)
 
-if (Seastar_DPDK)
-  set (seastar_dpdk_obj seastar-dpdk.o)
-endif ()
-
 add_library (seastar
   ${http_chunk_parsers_file}
   ${http_request_parser_file}
-  ${seastar_dpdk_obj}
   include/seastar/core/abort_source.hh
   include/seastar/core/alien.hh
   include/seastar/core/align.hh
@@ -767,7 +764,7 @@ set (Seastar_PRIVATE_CXX_FLAGS
   -UNDEBUG
   -Wall
   -Werror
-  -Wno-array-bounds # Disabled because of https://gcc.gnu.org/bugzilla/show_bug.cgi?id=93437
+  -Wimplicit-fallthrough
   -Wno-error=deprecated-declarations)
 if (NOT BUILD_SHARED_LIBS)
   list (APPEND Seastar_PRIVATE_CXX_FLAGS -fvisibility=hidden)
@@ -795,9 +792,15 @@ target_link_libraries (seastar
     StdAtomic::atomic
     lksctp-tools::lksctp-tools
     rt::rt
+    ucontext::ucontext
     yaml-cpp::yaml-cpp
     "$<BUILD_INTERFACE:Valgrind::valgrind>"
     Threads::Threads)
+if (Seastar_DPDK)
+  target_link_libraries (seastar
+    PRIVATE
+      DPDK::dpdk)
+endif()
 
 set (Seastar_SANITIZE_MODES "Debug" "Sanitize")
 if ((Seastar_SANITIZE STREQUAL "ON") OR
@@ -865,7 +868,8 @@ if (MaybeUninitialized_FOUND)
 endif ()
 
 if (Seastar_SSTRING)
-  target_compile_options (seastar PUBLIC -DSEASTAR_SSTRING)
+  target_compile_definitions (seastar
+    PUBLIC SEASTAR_SSTRING)
 endif ()
 
 if (LinuxMembarrier_FOUND)
@@ -936,40 +940,18 @@ if (Seastar_DEFERRED_ACTION_REQUIRE_NOEXCEPT)
 endif ()
 
 if (Seastar_DPDK)
-  #
-  # The DPDK architecture needs to be transitively applied to consumers of Seastar as well.
-  #
-
-  set (Seastar_ARCH_FOR_native "native")
-  set (Seastar_ARCH_FOR_nhm "nehalem")
-  set (Seastar_ARCH_FOR_wsm "westmere")
-  set (Seastar_ARCH_FOR_snb "sandybridge")
-  set (Seastar_ARCH_FOR_ivb "ivybridge")
-  set (Seastar_ARCH_FOR_hsw "haswell")
-  set (Seastar_ARCH_FOR_armv8a "armv8-a")
-  set (Seastar_ARCH ${Seastar_ARCH_FOR_${Seastar_DPDK_MACHINE}})
-
-  if (NOT Seastar_ARCH)
-    message (FATAL_ERROR "Unrecognized DPDK machine identifier: ${Seastar_DPDK_MACHINE}")
-  endif ()
-
-  target_compile_options (seastar
-    PUBLIC -march=${Seastar_ARCH})
-
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64")
+    target_compile_options (seastar
+      PUBLIC
+        -mcpu=${Seastar_DPDK_MACHINE}
+        -mtune=${Seastar_DPDK_MACHINE})
+  else()
+    target_compile_options (seastar
+      PUBLIC
+        -march=${Seastar_DPDK_MACHINE})
+  endif()
   target_compile_definitions (seastar
     PUBLIC SEASTAR_HAVE_DPDK)
-
-  # No pmd driver code will be pulled in without "--whole-archive". To
-  # avoid exposing that to seastar users, combine dpdk into a single
-  # .o file.
-  add_custom_command (
-    OUTPUT seastar-dpdk.o
-    COMMAND ld -r -o seastar-dpdk.o --whole-archive ${dpdk_LIBRARIES} --no-whole-archive
-  )
-
-  # This just provides the include path to cmake
-  target_link_libraries (seastar
-    PUBLIC dpdk::dpdk)
 endif ()
 
 if (Seastar_HWLOC)
@@ -996,6 +978,13 @@ if (Seastar_NUMA)
 
   target_link_libraries (seastar
     PRIVATE numactl::numactl)
+endif ()
+
+if (SystemTap-SDT_FOUND)
+  list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_SYSTEMTAP_SDT)
+
+  target_link_libraries (seastar
+    PRIVATE SystemTap::SDT)
 endif ()
 
 seastar_supports_flag ("-Werror=unused-result" ErrorUnused_FOUND)
@@ -1030,6 +1019,18 @@ if (Seastar_DEBUG_SHARED_PTR IN_LIST True_STRING_VALUES OR
   target_compile_definitions (seastar
     PUBLIC
       SEASTAR_DEBUG_SHARED_PTR)
+endif ()
+
+include (CheckCXXSourceCompiles)
+file (READ ${CMAKE_CURRENT_LIST_DIR}/cmake/code_tests/stdout_test.cc _stdout_test_code)
+check_cxx_source_compiles ("${_stdout_test_code}" Stdout_Can_Be_Used_As_Identifier)
+if (Stdout_Can_Be_Used_As_Identifier)
+  # "stdout" is defined as a macro by the C++ standard, so we cannot assume
+  # that the macro is always expanded into an identifier which can be re-used
+  # to name a enumerator in the declaration of an enumeration.
+  target_compile_definitions (seastar
+    PUBLIC
+      SEASTAR_LOGGER_TYPE_STDOUT)
 endif ()
 
 set (Seastar_STACK_GUARD_MODES "Debug" "Sanitize" "Dev")
