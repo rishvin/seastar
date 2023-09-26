@@ -35,18 +35,57 @@ seastar::logger logger("word_count");
 static constexpr size_t k_page_size = 4096;
 
 /**
- * An abstract class that represents the task to be performed on the file. Each
- * task is associated with the file_processor.
+ * A class that computes the count of each word in a file. after the file is
+ * fully processed, the results from each shard are aggregated and the total
+ * count of each word is printed.
  */
-class file_processor_task {
+class word_count_task {
 public:
-    virtual ~file_processor_task() = default;
+    using ptr = std::unique_ptr<word_count_task>;
 
-    // Called when each character of the file is processed.
-    virtual void process(const char& ch) = 0;
+    void process(const char& ch) {
+        static constexpr const char* k_delimiters = " \n.,:;";
+
+        if (std::strchr(k_delimiters, ch) == nullptr) {
+            _word += ch;
+            return;
+        }
+
+        if (!_word.empty()) {
+            (*_word_count_map)[_word]++;
+            _word.clear();
+        }
+    }
+
+    static void on_complete(std::vector<ptr>&& tasks) {
+        std::unordered_map<std::string, size_t> agg_word_count_map;
+        size_t total_words = 0;
+
+        for (auto&& task : tasks) {
+            auto& wc_task = dynamic_cast<word_count_task&>(*task);
+            for (auto&& [word, count] : *wc_task._word_count_map) {
+                agg_word_count_map[word] += count;
+                total_words += count;
+            }
+        }
+
+        // Note: This code could stall the shard 0 for some time. The future author
+        // could write the result to a file.
+        std::stringstream sstream;
+        sstream << "  Total words: " << total_words << std::endl;
+        for (auto&& [word, count] : agg_word_count_map) {
+            sstream << "  " << word << ": " << count << std::endl;
+        }
+        logger.info("\nWord count report:\n{}", sstream.str());
+    }
+
+    static ptr create() { return std::make_unique<word_count_task>(); }
+
+private:
+    std::string _word;
+    std::unique_ptr<std::unordered_map<std::string, size_t>> _word_count_map
+        = std::make_unique<std::unordered_map<std::string, size_t>>();
 };
-
-using file_processor_task_ptr = std::unique_ptr<file_processor_task>;
 
 /**
  * A class that processes a chunk of the provided file file_path. A chunk is a
@@ -58,13 +97,13 @@ using file_processor_task_ptr = std::unique_ptr<file_processor_task>;
 class file_processor {
 public:
     file_processor(const std::string& file_path, const size_t& start_offset,
-                   const size_t& estimated_bytes_to_read, file_processor_task_ptr&& task)
+                   const size_t& estimated_bytes_to_read, word_count_task::ptr&& task)
         : _file_path{ file_path },
           _file_offset{ start_offset },
           _estimated_bytes_to_read{ estimated_bytes_to_read },
           _task{ std::move(task) } {}
 
-    seastar::future<file_processor_task_ptr> process() {
+    seastar::future<word_count_task::ptr> process() {
         return seastar::open_file_dma(_file_path, seastar::open_flags::ro)
             .then([this](auto file_desc) {
                 _file_desc = std::move(file_desc);
@@ -83,7 +122,7 @@ public:
                                });
                        })
                     .then([this] {
-                        return seastar::make_ready_future<file_processor_task_ptr>(
+                        return seastar::make_ready_future<word_count_task::ptr>(
                             std::move(_task));
                     });
             });
@@ -171,22 +210,10 @@ private:
 
     seastar::file _file_desc;
 
-    file_processor_task_ptr _task;
+    word_count_task::ptr _task;
 };
 
 using file_processor_ptr = std::unique_ptr<file_processor>;
-
-/**
- * Provides a set of functions that are used by the file_processor_runner.
- */
-struct file_processor_runner_funcs {
-    // creates a file_processor_task_ptr object.
-    std::function<file_processor_task_ptr()> create_task_fn;
-
-    // Called when all chunks of a file are processed. the parameter contains the
-    // processed tasks.
-    std::function<void(std::vector<file_processor_task_ptr>&&)> on_complete_fn;
-};
 
 /**
  * A class that runs file processors. it takes the path to the file to process,
@@ -197,7 +224,7 @@ struct file_processor_runner_funcs {
  */
 class file_processor_runner {
 public:
-    file_processor_runner(file_processor_runner_funcs&& funcs) : _funcs{ std::move(funcs) } {
+    file_processor_runner() {
         _app.add_options()("file_path", boost::program_options::value<std::string>()->required(),
                            "path to the file to process");
     }
@@ -231,19 +258,19 @@ private:
         }
 
         seastar::future<> on_complete(
-            std::function<void(std::vector<file_processor_task_ptr>&&)> on_result_ready_fn) {
+            std::function<void(std::vector<word_count_task::ptr>&&)> on_result_ready_fn) {
             return seastar::when_all_succeed(_futures.begin(), _futures.end())
                 .then(
                     [on_result_ready_fn](auto results) { on_result_ready_fn(std::move(results)); });
         }
 
-        void set_result(size_t core_id, file_processor_task_ptr&& result) {
+        void set_result(size_t core_id, word_count_task::ptr&& result) {
             _promises[core_id].set_value(std::move(result));
         }
 
     private:
-        std::vector<seastar::promise<file_processor_task_ptr>> _promises;
-        std::vector<seastar::future<file_processor_task_ptr>> _futures;
+        std::vector<seastar::promise<word_count_task::ptr>> _promises;
+        std::vector<seastar::future<word_count_task::ptr>> _futures;
     };
 
     seastar::future<> _start_distributed_processing(std::string file_path, size_t file_size) {
@@ -275,7 +302,7 @@ private:
             .then([this, task_results] {
                 // Wait until all results are ready and then call the provided
                 // on_complete_fn function.
-                return task_results->on_complete(_funcs.on_complete_fn);
+                return task_results->on_complete(word_count_task::on_complete);
             });
     }
 
@@ -288,65 +315,19 @@ private:
                   file_size - (seastar::smp::count - 2) * estimated_chunk_size;
 
         return std::make_unique<file_processor>(file_path, offset, estimated_bytes_to_read,
-                                                _funcs.create_task_fn());
+                                                word_count_task::create());
     }
 
     seastar::app_template _app;
 
     std::shared_ptr<std::vector<file_processor_ptr>> _processors
         = std::make_shared<std::vector<file_processor_ptr>>();
-
-    file_processor_runner_funcs _funcs;
 };
 
-/**
- * A class that computes the count of each word in a file. after the file is
- * fully processed, the results from each shard are aggregated and the total
- * count of each word is printed.
- */
-class word_count_task : public file_processor_task {
-public:
-    void process(const char& ch) final {
-        static constexpr const char* k_delimiters = " \n.,:;";
-        if (std::strchr(k_delimiters, ch) == nullptr) {
-            _word += ch;
-            return;
-        }
-
-        if (!_word.empty()) {
-            (*_word_count_map)[_word]++;
-            _word.clear();
-        }
-    }
-
-    static void on_complete(std::vector<file_processor_task_ptr>&& tasks) {
-        std::unordered_map<std::string, size_t> agg_word_count_map;
-        size_t total_words = 0;
-        for (auto&& task : tasks) {
-            auto& wc_task = dynamic_cast<word_count_task&>(*task);
-            for (auto&& [word, count] : *wc_task._word_count_map) {
-                agg_word_count_map[word] += count;
-                total_words += count;
-            }
-        }
-
-        // Note: This code could stall the shard 0 for some time. The future author
-        // could write the result to a file.
-        logger.info("--word count report: total: {}", total_words);
-        for (auto&& [word, count] : agg_word_count_map) { logger.info(" {}: {}", word, count); }
-    }
-
-    static file_processor_task_ptr create() { return std::make_unique<word_count_task>(); }
-
-private:
-    std::string _word;
-    std::unique_ptr<std::unordered_map<std::string, size_t>> _word_count_map
-        = std::make_unique<std::unordered_map<std::string, size_t>>();
-};
 } // namespace
 
 int main(int argc, char** argv) {
     seastar::app_template app;
-    file_processor_runner runner({ word_count_task::create, word_count_task::on_complete });
+    file_processor_runner runner{};
     return runner.run(argc, argv);
 }
