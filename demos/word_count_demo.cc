@@ -24,6 +24,7 @@
 #include <seastar/core/aligned_buffer.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/log.hh>
@@ -94,37 +95,32 @@ private:
  * size of bytes to read, the processor can read more than the provided chunk
  * size.
  */
-class file_processor {
+class word_count_processor {
 public:
-    file_processor(const std::string& file_path, const size_t& start_offset,
-                   const size_t& estimated_bytes_to_read, word_count_task::ptr&& task)
+    word_count_processor(const std::string& file_path, const size_t& start_offset,
+                         const size_t& estimated_bytes_to_read, word_count_task::ptr&& task)
         : _file_path{ file_path },
-          _file_offset{ start_offset },
+          _start_offset{ start_offset },
           _estimated_bytes_to_read{ estimated_bytes_to_read },
           _task{ std::move(task) } {}
 
     seastar::future<word_count_task::ptr> process() {
         return seastar::open_file_dma(_file_path, seastar::open_flags::ro)
             .then([this](auto file_desc) {
-                _file_desc = std::move(file_desc);
-                return seastar::repeat([this] {
-                           return seastar::do_with(
-                               // Allocate a buffer aligned to the page size.
-                               seastar::allocate_aligned_buffer<char>(k_page_size, k_page_size),
-                               [this](auto& buffer) {
-                                   return _file_desc
-                                       .dma_read(_file_offset, buffer.get(), k_page_size)
-                                       .then([this, &buffer](size_t bytes_read) {
-                                           return _process_buffer(buffer.get(), bytes_read) ?
-                                                      seastar::stop_iteration::yes :
-                                                      seastar::stop_iteration::no;
-                                       });
+                _input_stream = std::move(make_file_input_stream(std::move(file_desc)));
+                return _input_stream.skip(_start_offset).then([this] {
+                    return seastar::repeat([this] {
+                               return _input_stream.read_exactly(k_page_size).then([this](auto&& buffer) {
+                                   return _process_buffer(buffer.get(), buffer.size()) ?
+                                              seastar::stop_iteration::yes :
+                                              seastar::stop_iteration::no;
                                });
-                       })
-                    .then([this] {
-                        return seastar::make_ready_future<word_count_task::ptr>(
-                            std::move(_task));
-                    });
+                           })
+                        .then([this] {
+                            return seastar::make_ready_future<word_count_task::ptr>(
+                                std::move(_task));
+                        });
+                });
             });
     }
 
@@ -153,12 +149,11 @@ private:
                 = _populate_remaining(buffer, buffer_size, buffer_offset);
         }
 
-        _file_offset += k_page_size;
         return is_complete;
     }
 
     size_t _get_buffer_start_offset(const char* buffer, const size_t& buffer_size) {
-        if (_file_offset == 0 || _total_bytes_read > 0) { return 0; }
+        if (_start_offset == 0 || _total_bytes_read > 0) { return 0; }
 
         // If the chunk start offset lies in the middle of a line, then skip all
         // characters until a new line character is found.
@@ -204,16 +199,18 @@ private:
 
 private:
     const std::string _file_path;
-    size_t _file_offset;
+
+    const size_t _start_offset;
     const size_t _estimated_bytes_to_read;
+
     size_t _total_bytes_read = 0;
 
-    seastar::file _file_desc;
+    seastar::input_stream<char> _input_stream;
 
     word_count_task::ptr _task;
 };
 
-using file_processor_ptr = std::unique_ptr<file_processor>;
+using word_count_processor_ptr = std::unique_ptr<word_count_processor>;
 
 /**
  * A class that runs file processors. it takes the path to the file to process,
@@ -222,9 +219,9 @@ using file_processor_ptr = std::unique_ptr<file_processor>;
  * of a file. The results of the file processor are collected and passed to the
  * on_complete_fn function.
  */
-class file_processor_runner {
+class word_count_runner {
 public:
-    file_processor_runner() {
+    word_count_runner() {
         _app.add_options()("file_path", boost::program_options::value<std::string>()->required(),
                            "path to the file to process");
     }
@@ -306,28 +303,28 @@ private:
             });
     }
 
-    file_processor_ptr _create_processors(size_t core_id, std::string file_path, size_t file_size,
-                                          size_t estimated_chunk_size) {
+    word_count_processor_ptr _create_processors(size_t core_id, std::string file_path, size_t file_size,
+                                                size_t estimated_chunk_size) {
         const size_t offset = core_id * estimated_chunk_size;
         const size_t estimated_bytes_to_read
             = core_id != seastar::smp::count - 1 ?
                   estimated_chunk_size :
                   file_size - (seastar::smp::count - 2) * estimated_chunk_size;
 
-        return std::make_unique<file_processor>(file_path, offset, estimated_bytes_to_read,
-                                                word_count_task::create());
+        return std::make_unique<word_count_processor>(file_path, offset, estimated_bytes_to_read,
+                                                      word_count_task::create());
     }
 
     seastar::app_template _app;
 
-    std::shared_ptr<std::vector<file_processor_ptr>> _processors
-        = std::make_shared<std::vector<file_processor_ptr>>();
+    std::shared_ptr<std::vector<word_count_processor_ptr>> _processors
+        = std::make_shared<std::vector<word_count_processor_ptr>>();
 };
 
 } // namespace
 
 int main(int argc, char** argv) {
     seastar::app_template app;
-    file_processor_runner runner{};
+    word_count_runner runner{};
     return runner.run(argc, argv);
 }
