@@ -58,25 +58,31 @@ public:
         }
     }
 
-    static void on_complete(std::vector<ptr>&& tasks) {
-        std::unordered_map<std::string, size_t> agg_word_count_map;
-        size_t total_words = 0;
+    static ptr on_complete(ptr&& task_left, ptr&& task_right) {
+        auto reduced_task = create();
+        auto& reduce_map = *reduced_task->_word_count_map;
 
-        for (auto&& task : tasks) {
+        for (auto&& task : { std::move(task_left), std::move(task_right) }) {
             auto& wc_task = dynamic_cast<word_count_task&>(*task);
             for (auto&& [word, count] : *wc_task._word_count_map) {
-                agg_word_count_map[word] += count;
-                total_words += count;
+                reduce_map[word] += count;
             }
         }
 
+        return reduced_task;
+    }
+
+    void print() {
         // Note: This code could stall the shard 0 for some time. The future author
         // could write the result to a file.
         std::stringstream sstream;
-        sstream << "  Total words: " << total_words << std::endl;
-        for (auto&& [word, count] : agg_word_count_map) {
+        size_t total_words = 0;
+
+        for (auto&& [word, count] : *_word_count_map) {
             sstream << "  " << word << ": " << count << std::endl;
+            total_words += count;
         }
+        sstream << "\nTotal words: " << total_words << std::endl;
         logger.info("\nWord count report:\n{}", sstream.str());
     }
 
@@ -241,36 +247,32 @@ public:
     }
 
 private:
-    /**
-     * Provides a vector of promises and corresponding futures that are used to
-     * collect the file_processor_task from the file processors. The on_complete
-     * function calls the on_result_ready_fn function when all the results are
-     * ready.
-     */
-    class file_processor_results {
-    public:
-        file_processor_results(size_t count) : _promises(count) {
-            _futures.reserve(count);
-            for (auto& promise : _promises) { _futures.push_back(promise.get_future()); }
-        }
-
-        seastar::future<> on_complete(
-            std::function<void(std::vector<word_count_task::ptr>&&)> on_result_ready_fn) {
-            return seastar::when_all_succeed(_futures.begin(), _futures.end())
-                .then(
-                    [on_result_ready_fn](auto results) { on_result_ready_fn(std::move(results)); });
-        }
-
-        void set_result(size_t core_id, word_count_task::ptr&& result) {
-            _promises[core_id].set_value(std::move(result));
-        }
-
-    private:
-        std::vector<seastar::promise<word_count_task::ptr>> _promises;
-        std::vector<seastar::future<word_count_task::ptr>> _futures;
-    };
-
     seastar::future<> _start_distributed_processing(std::string file_path, size_t file_size) {
+        return _file_metadata.start(file_path, file_size)
+            .then([this] {
+                return _file_metadata.map_reduce0(
+                    [this](auto file_metadata) {
+                        auto [file_path, file_size] = file_metadata;
+                        auto processor = _create_processor(
+                            seastar::this_shard_id(), file_path, file_size);
+
+                        return seastar::do_with(std::move(processor), [](auto& processor) {
+                            return processor->process().then([](auto&& task) {
+                                return std::move(task);
+                            });
+                        });
+                    },
+                    word_count_task::create(),
+                    word_count_task::on_complete);
+            })
+            .then([this](auto&& task) {
+                task->print();
+                return _file_metadata.stop();
+            });
+    }
+
+    word_count_processor_ptr _create_processor(
+        size_t core_id, std::string file_path, size_t file_size) {
         // Calculate the estimated chunk size aligned to the page size.
         const auto estimated_chunk_size = [&]() {
             size_t chunk_size = file_size / seastar::smp::count;
@@ -278,33 +280,6 @@ private:
             return chunk_size > k_page_size ? chunk_size : k_page_size;
         }();
 
-        // An instance of file_processor_results is used to collect the result
-        // from each file processor and then wait for all results to be ready.
-        auto task_results = std::make_shared<file_processor_results>(seastar::smp::count);
-
-        return seastar::smp::invoke_on_all([this, file_path, file_size, estimated_chunk_size,
-                                            task_results] {
-                   auto core_id = seastar::this_shard_id();
-                   auto processor
-                       = _create_processors(core_id, file_path, file_size, estimated_chunk_size);
-                   return seastar::do_with(std::move(processor), [task_results](auto& processor) {
-                       return processor->process().then([task_results](auto&& processor_task) {
-                           // move the processed task to the 'task_results' for
-                           // a particular shard.
-                           task_results->set_result(seastar::this_shard_id(),
-                                                    std::move(processor_task));
-                       });
-                   });
-               })
-            .then([this, task_results] {
-                // Wait until all results are ready and then call the provided
-                // on_complete_fn function.
-                return task_results->on_complete(word_count_task::on_complete);
-            });
-    }
-
-    word_count_processor_ptr _create_processors(size_t core_id, std::string file_path, size_t file_size,
-                                                size_t estimated_chunk_size) {
         const size_t offset = core_id * estimated_chunk_size;
         const size_t estimated_bytes_to_read
             = core_id != seastar::smp::count - 1 ?
@@ -317,8 +292,7 @@ private:
 
     seastar::app_template _app;
 
-    std::shared_ptr<std::vector<word_count_processor_ptr>> _processors
-        = std::make_shared<std::vector<word_count_processor_ptr>>();
+    seastar::sharded<std::tuple<std::string, size_t>> _file_metadata;
 };
 
 } // namespace
