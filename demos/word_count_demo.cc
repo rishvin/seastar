@@ -36,15 +36,20 @@ seastar::logger logger("word_count");
 static constexpr size_t k_page_size = 4096;
 
 /**
- * A class that computes the count of each word in a file. after the file is
- * fully processed, the results from each shard are aggregated and the total
- * count of each word is printed.
+ * A class that represents a task that is allocated to each 'word_count_processor' and processes
+ * characters from a segment of a file. The class perform word counting in a map-reduce fashion.
  */
 class word_count_task {
 public:
     using ptr = std::unique_ptr<word_count_task>;
+    using word_count_map = std::unordered_map<std::string, size_t>;
+    using result = std::unique_ptr<word_count_map>;
 
-    void process(const char& ch) {
+    /**
+     * Processes a character of a file and updates the word count map. The word count map tracks
+     * count for each word.
+     */
+    void map(const char& ch) {
         static constexpr const char* k_delimiters = " \n.,:;";
 
         if (std::strchr(k_delimiters, ch) == nullptr) {
@@ -58,48 +63,62 @@ public:
         }
     }
 
-    static ptr on_complete(ptr&& task_left, ptr&& task_right) {
+    /**
+     * Reduces the results of two tasks into a single task and returns the reduced task.
+     */
+    static ptr reduce(ptr&& task_left, ptr&& task_right) {
         auto reduced_task = create();
         auto& reduce_map = *reduced_task->_word_count_map;
 
         for (auto&& task : { std::move(task_left), std::move(task_right) }) {
             auto& wc_task = dynamic_cast<word_count_task&>(*task);
-            for (auto&& [word, count] : *wc_task._word_count_map) {
-                reduce_map[word] += count;
-            }
+            for (auto&& [word, count] : *wc_task._word_count_map) { reduce_map[word] += count; }
         }
 
         return reduced_task;
     }
 
-    void print() {
-        // Note: This code could stall the shard 0 for some time. The future author
-        // could write the result to a file.
-        std::stringstream sstream;
-        size_t total_words = 0;
+    /**
+     * Releases the ownership of the word count map from the task.
+     */
+    result&& release() { return std::move(_word_count_map); }
 
-        for (auto&& [word, count] : *_word_count_map) {
-            sstream << "  " << word << ": " << count << std::endl;
-            total_words += count;
-        }
-        sstream << "\nTotal words: " << total_words << std::endl;
-        logger.info("\nWord count report:\n{}", sstream.str());
-    }
-
+    /**
+     * Creates an instance of the word count task.
+     */
     static ptr create() { return std::make_unique<word_count_task>(); }
 
 private:
+    // Keeps track of the current word being processed.
     std::string _word;
-    std::unique_ptr<std::unordered_map<std::string, size_t>> _word_count_map
-        = std::make_unique<std::unordered_map<std::string, size_t>>();
+
+    // Maps each word to its count.
+    result _word_count_map = std::make_unique<word_count_map>();
 };
 
 /**
- * A class that processes a chunk of the provided file file_path. A chunk is a
- * part of the file and its starting offset is determined by the start_offset.
- * The parameter estimated_bytes_to_read is used to determine the estimated
- * size of bytes to read, the processor can read more than the provided chunk
- * size.
+ * A class that processes a segment of the provided file. A segment is a chunk of a file whose
+ * starting offset is determined by the 'start_offset' and size by the 'estimated_bytes_to_read'.
+ *
+ * Each word count processor runs in a separate shard and invoke 'word_count_task::map' on each
+ * character to perform mapper task.
+ *
+ * The processor is designed to handle words in a file that may be partitioned across
+ * multiple word count processors.
+ *
+ * For instance, consider the sentence: "An apple is a fruit. One should eat apple every day."
+ *
+ * If this sentence is divided between two processors as follows:
+ * Processor 1: "An apple is a fru"
+ * Processor 2: "it. One should eat apple every day."
+ *
+ * In this scenario, Processor 1 reads beyond the word 'fru' until it encounters a newline,
+ * and Processor 2 begins processing characters after the newline. Consequently,
+ * Processor 1 processes: "An apple is a fruit.", and
+ * Processor 2 processes: "One should eat apple every day."
+ *
+ * NOTE: The processor can read more than the provided segment size provided by the
+ * 'estimated_bytes_to_read'.
  */
 class word_count_processor {
 public:
@@ -110,17 +129,21 @@ public:
           _estimated_bytes_to_read{ estimated_bytes_to_read },
           _task{ std::move(task) } {}
 
+    /**
+     * Processes the file and returns a future that is ready when the file is processed.
+     */
     seastar::future<word_count_task::ptr> process() {
         return seastar::open_file_dma(_file_path, seastar::open_flags::ro)
             .then([this](auto file_desc) {
                 _input_stream = std::move(make_file_input_stream(std::move(file_desc)));
                 return _input_stream.skip(_start_offset).then([this] {
                     return seastar::repeat([this] {
-                               return _input_stream.read_exactly(k_page_size).then([this](auto&& buffer) {
-                                   return _process_buffer(buffer.get(), buffer.size()) ?
-                                              seastar::stop_iteration::yes :
-                                              seastar::stop_iteration::no;
-                               });
+                               return _input_stream.read_exactly(k_page_size)
+                                   .then([this](auto&& buffer) {
+                                       return _process_buffer(buffer.get(), buffer.size()) ?
+                                                  seastar::stop_iteration::yes :
+                                                  seastar::stop_iteration::no;
+                                   });
                            })
                         .then([this] {
                             return seastar::make_ready_future<word_count_task::ptr>(
@@ -131,6 +154,9 @@ public:
     }
 
 private:
+    /**
+     * Processes the provided buffer and returns true if the file processing is complete.
+     */
     bool _process_buffer(const char* buffer, const size_t& buffer_size) {
         if (buffer_size == 0) { return true; }
 
@@ -147,9 +173,8 @@ private:
                 = _process_chars(buffer, buffer_size, buffer_offset);
         }
 
-        // Even if all bytes of the chunk are processed, a chunk is considered not
-        // fully processed if the last character read was not a new line character.
-        // The processing should continue until a new line character is found.
+        // Even if all characters of the segment are processed, a segment is considered not
+        // fully processed until the last character read is not new line character.
         if (!is_complete && _total_bytes_read >= _estimated_bytes_to_read) {
             std::tie(is_complete, buffer_offset)
                 = _populate_remaining(buffer, buffer_size, buffer_offset);
@@ -158,11 +183,14 @@ private:
         return is_complete;
     }
 
+    /**
+     * Returns the offset of the buffer where the processing should start.
+     */
     size_t _get_buffer_start_offset(const char* buffer, const size_t& buffer_size) {
         if (_start_offset == 0 || _total_bytes_read > 0) { return 0; }
 
-        // If the chunk start offset lies in the middle of a line, then skip all
-        // characters until a new line character is found.
+        // If the start offset lies in the middle of a line, then skip all characters until a new
+        // line character is found.
         const char* not_found = buffer + buffer_size;
         const char* result = std::find(buffer, buffer + buffer_size, '\n');
         auto offset = result == not_found ? buffer_size : result - buffer + 1;
@@ -170,6 +198,10 @@ private:
         return offset;
     }
 
+    /**
+     * Processes characters from the buffer until the end of the buffer is reached or the total
+     * bytes read is equal to the estimated bytes to read.
+     */
     std::pair<bool, size_t> _process_chars(const char* buffer, const size_t& buffer_size,
                                            size_t offset) {
         char ch = '\0';
@@ -181,9 +213,11 @@ private:
         return { ch == '\n', offset };
     }
 
+    /**
+     * Processes any remaining characters in the buffer until a new line character is found.
+     */
     std::pair<bool, size_t> _populate_remaining(const char* buffer, const size_t& buffer_size,
                                                 size_t offset) {
-        // Process all characters until a new line character is found.
         bool is_complete = false;
         for (; offset < buffer_size; offset++) {
             const char ch = buffer[offset];
@@ -198,32 +232,43 @@ private:
         return { is_complete, offset };
     }
 
+    /**
+     * Invokes the task processor mapper function to process the provided character.
+     */
     void _invoke_task_processor(const char& ch) {
         _total_bytes_read++;
-        _task->process(ch);
+        _task->map(ch);
     }
 
 private:
+    // The path to the file to process.
     const std::string _file_path;
 
+    // The offset of the file where the processing should start.
     const size_t _start_offset;
+
+    // The estimated number of bytes to read from the file.
     const size_t _estimated_bytes_to_read;
 
+    // The total number of bytes read from the file.
     size_t _total_bytes_read = 0;
 
+    // The input stream to read the file.
     seastar::input_stream<char> _input_stream;
 
+    // The task that is allocated to this processor.
     word_count_task::ptr _task;
 };
 
 using word_count_processor_ptr = std::unique_ptr<word_count_processor>;
 
 /**
- * A class that runs file processors. it takes the path to the file to process,
- * splits the file into chunks and allocate each chunk to a file processor. Each
- * file processor runs in a separate shard and process the corresponding chunk
- * of a file. The results of the file processor are collected and passed to the
- * on_complete_fn function.
+ * A class that runs the word count processing on a provided file. This class is responsible for
+ * splitting the file into segments, where a segment is a chunk of a file and each shard is
+ * allocated a segment of file. Each shard runs a word count processor on its segment of the file.
+ * The word count task from each shard is finally reduced to a single word count task. The result
+ * from the final word count task is returned to the caller if the file processing is successful,
+ * otherwise a null pointer is returned.
  */
 class word_count_runner {
 public:
@@ -232,8 +277,12 @@ public:
                            "path to the file to process");
     }
 
-    int run(int argc, char** argv) {
-        return _app.run(argc, argv, [this] {
+    /**
+     * Runs the word count processing on the provided file and returns the result if the file
+     * processing is successful, otherwise a null pointer is returned.
+     */
+    word_count_task::result run(int argc, char** argv) {
+        auto status = _app.run(argc, argv, [this] {
             static constexpr const char* k_file_path_key = "file_path";
 
             auto&& config = _app.configuration();
@@ -241,38 +290,45 @@ public:
 
             return seastar::file_stat(file_path).then(
                 [this, file_path](seastar::stat_data&& stat) -> seastar::future<> {
-                    return _start_distributed_processing(file_path, stat.size);
+                    return _run(file_path, stat.size);
                 });
         });
+
+        return status == 0 ? std::move(_result) : nullptr;
     }
 
 private:
-    seastar::future<> _start_distributed_processing(std::string file_path, size_t file_size) {
+    /**
+     * Runs the word count processor on each shard and finally reduces the results from all shard to
+     * single word count task.
+     */
+    seastar::future<> _run(std::string file_path, size_t file_size) {
         return _file_metadata.start(file_path, file_size)
             .then([this] {
                 return _file_metadata.map_reduce0(
                     [this](auto file_metadata) {
                         auto [file_path, file_size] = file_metadata;
-                        auto processor = _create_processor(
-                            seastar::this_shard_id(), file_path, file_size);
+                        auto processor
+                            = _create_processor(seastar::this_shard_id(), file_path, file_size);
 
                         return seastar::do_with(std::move(processor), [](auto& processor) {
-                            return processor->process().then([](auto&& task) {
-                                return std::move(task);
-                            });
+                            return processor->process().then(
+                                [](auto&& task) { return std::move(task); });
                         });
                     },
-                    word_count_task::create(),
-                    word_count_task::on_complete);
+                    word_count_task::create(), word_count_task::reduce);
             })
             .then([this](auto&& task) {
-                task->print();
+                _result = std::move(task->release());
                 return _file_metadata.stop();
             });
     }
 
-    word_count_processor_ptr _create_processor(
-        size_t core_id, std::string file_path, size_t file_size) {
+    /**
+     * Creates a word count processor for the provided core id, file path and file size.
+     */
+    word_count_processor_ptr _create_processor(size_t core_id, std::string file_path,
+                                               size_t file_size) {
         // Calculate the estimated chunk size aligned to the page size.
         const auto estimated_chunk_size = [&]() {
             size_t chunk_size = file_size / seastar::smp::count;
@@ -290,15 +346,55 @@ private:
                                                       word_count_task::create());
     }
 
+    // The seastar application.
     seastar::app_template _app;
 
+    // The file metadata that is copied to each shard.
     seastar::sharded<std::tuple<std::string, size_t>> _file_metadata;
+
+    // The result of the word count processing.
+    word_count_task::result _result;
 };
 
 } // namespace
 
+/**
+ * This is a demo application that performs word count on a provided file.
+ *
+ * Usage: word_count_demo --file_path <path to file>
+ *
+ * The algorithm is a follows:
+ * 1. The 'word_count_runner.run()' method is invoked to run the word count processing on the file.
+ * 2. The provided file is then divided equally into chunks called segments, and each segment is
+ * allocated to each seastar shard.
+ * 3. Each shard runs a 'word_count_processor' on its segment of the file. The job of the
+ * 'word_count_processor' is to process characters on its segment of the file.
+ * 4. Each 'word_count_processor' is assigned a 'word_count_task' that is responsible for performing
+ * the word count.
+ * 5. After successful processing for each shard, the results from each shard are reduced to a
+ * single 'word_count_task' using 'word_count_task::reduce'.
+ * 6. The final reduced 'word_count_task' releases a std::map that contains the word count.
+ * 7. The resultant std::map data is then printed to the console.
+ *
+ */
 int main(int argc, char** argv) {
     seastar::app_template app;
+
     word_count_runner runner{};
-    return runner.run(argc, argv);
+    auto result = runner.run(argc, argv);
+    if (!result) {
+        logger.error("Failed to fetch word count result.");
+        return 1;
+    }
+
+    std::stringstream sstream;
+    size_t total_words = 0;
+
+    for (auto&& [word, count] : *result) {
+        sstream << "  " << word << ": " << count << std::endl;
+        total_words += count;
+    }
+
+    sstream << "Total words: " << total_words << std::endl;
+    logger.info("\nWord count report:\n{}", sstream.str());
 }
